@@ -1,0 +1,1 @@
+ python .\grade_pdf_precis.py `  --pdf .\input.pdf `  --output-json .\precis_result.json `  --output-pdf .\output.pdf `  --rubric-docx ".\Precis Rubric.docx" `  --annotations-rubric-docx ".\ANNOTATIONS RUBRIC FOR PRECIS.docx" `  --extra-json .\extra_text.json `  --colouring-scheme-image .\colouring_scheme.jpeg `  --env-file .\env

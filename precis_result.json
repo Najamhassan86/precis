@@ -1,0 +1,207 @@
+{
+  "grading": {
+    "topic": "A drop of water's transformation from insignificance to a famous pearl",
+    "student_title": "flourish of persian crown",
+    "student_precis_text": "Once, a drop into sad its tiny and negligible by passing through many hands",
+    "original_passage_word_count": 142,
+    "required_precis_word_count": 47,
+    "student_precis_word_count": 12,
+    "length_status": "Too Short",
+    "criteria": [
+      {
+        "id": "comprehension_understanding_of_passage",
+        "criterion": "Comprehension & Understanding of Passage",
+        "marks_allocated": 3,
+        "marks_awarded": 0.0,
+        "rating": "Poor",
+        "key_comments": "Misinterprets passage; omits drop's reflection, oyster incident, pearl formation, and final status on crown."
+      },
+      {
+        "id": "clarity_expression_language",
+        "criterion": "Clarity, Expression & Language",
+        "marks_allocated": 3,
+        "marks_awarded": 0.0,
+        "rating": "Poor",
+        "key_comments": "Unclear and confusing; garbled phrasing like 'into sad its tiny' lacks coherence and grammar."
+      },
+      {
+        "id": "brevity_conciseness",
+        "criterion": "Brevity & Conciseness",
+        "marks_allocated": 2,
+        "marks_awarded": 0.0,
+        "rating": "Poor",
+        "key_comments": "Far below required length (12 vs 47 words); underdeveloped and omits essential details."
+      },
+      {
+        "id": "organization_coherence",
+        "criterion": "Organization & Coherence",
+        "marks_allocated": 2,
+        "marks_awarded": 0.0,
+        "rating": "Poor",
+        "key_comments": "Lacks logical sequence; fragmented ideas without transitions or unity."
+      },
+      {
+        "id": "original_tone_meaning",
+        "criterion": "Original Tone & Meaning",
+        "marks_allocated": 2,
+        "marks_awarded": 1.0,
+        "rating": "Weak",
+        "key_comments": "Distorts fable's ironic, reflective tone; reduces moral to vague sadness."
+      },
+      {
+        "id": "originality_paraphrasing",
+        "criterion": "Originality & Paraphrasing",
+        "marks_allocated": 2,
+        "marks_awarded": 1.0,
+        "rating": "Weak",
+        "key_comments": "Minimal rephrasing; relies on source structure without full originality."
+      },
+      {
+        "id": "grammar_presentation",
+        "criterion": "Grammar, & Presentation",
+        "marks_allocated": 1,
+        "marks_awarded": 0.0,
+        "rating": "Poor",
+        "key_comments": "Major grammatical errors; incomplete sentences hinder understanding."
+      },
+      {
+        "id": "title",
+        "criterion": "Title",
+        "marks_allocated": 5,
+        "marks_awarded": 2.0,
+        "rating": "Poor",
+        "key_comments": "Vague and irrelevant; misses core theme of transformation (4 words, but not expressive)."
+      }
+    ],
+    "total_awarded": 4.0,
+    "overall_rating": "Weak",
+    "reasons_for_low_score": [
+      "Incomplete summary omitting key events and reflection.",
+      "Garbled, ungrammatical language.",
+      "Excessively short length.",
+      "Lack of structure and coherence.",
+      "Distorted original meaning and tone."
+    ],
+    "ideal_precis": {
+      "title": "Insignificant Drop Becomes Priceless Pearl",
+      "text": "A drop of water, falling into the sea, lamented its insignificance amid the vast ocean, deeming itself worthless. Swallowed by a nearby oyster mid-soliloquy, it hardened gradually into a pearl. After numerous adventures, it reached a diver's hands and now adorns the Persian crown."
+    },
+    "overall_remarks": ""
+  },
+  "criteria_template": [
+    {
+      "id": "comprehension_understanding_of_passage",
+      "criterion": "Comprehension & Understanding of Passage",
+      "marks_allocated": 3
+    },
+    {
+      "id": "clarity_expression_language",
+      "criterion": "Clarity, Expression & Language",
+      "marks_allocated": 3
+    },
+    {
+      "id": "brevity_conciseness",
+      "criterion": "Brevity & Conciseness",
+      "marks_allocated": 2
+    },
+    {
+      "id": "organization_coherence",
+      "criterion": "Organization & Coherence",
+      "marks_allocated": 2
+    },
+    {
+      "id": "original_tone_meaning",
+      "criterion": "Original Tone & Meaning",
+      "marks_allocated": 2
+    },
+    {
+      "id": "originality_paraphrasing",
+      "criterion": "Originality & Paraphrasing",
+      "marks_allocated": 2
+    },
+    {
+      "id": "grammar_presentation",
+      "criterion": "Grammar, & Presentation",
+      "marks_allocated": 1
+    },
+    {
+      "id": "title",
+      "criterion": "Title",
+      "marks_allocated": 5
+    }
+  ],
+  "ocr_pages": 2,
+  "annotations": [
+    {
+      "page": 2,
+      "type": "grammar_language",
+      "rubric_point": "The language used should be grammatically correct, clear, and suitable for formal academic writing.",
+      "anchor_quote": "into sad its tiny",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "fell sadly into the sea, as it was tiny",
+      "comment": "Rephrase garbled, ungrammatical fragment into clear sentence."
+    },
+    {
+      "page": 2,
+      "type": "comprehension_understanding_of_passage",
+      "rubric_point": "Misinterprets passage; omits drop's reflection, oyster incident, pearl formation, and final status on crown.",
+      "anchor_quote": "Once, a drop",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "Once, a drop fell into the sea, entered an oyster, and became a pearl.",
+      "comment": "Develop topic sentence to include essential passage events; currently omits core transformation."
+    },
+    {
+      "page": 2,
+      "type": "brevity_conciseness",
+      "rubric_point": "The overall length of the answer should match the marks allocated.",
+      "anchor_quote": "Once, a drop into sad its tiny and negligible by passing through many hands",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "[Expanded full summary of passage fable here].",
+      "comment": "Dramatically underdeveloped; add details on progression to pearl and reflection for required length."
+    },
+    {
+      "page": 2,
+      "type": "organization_coherence",
+      "rubric_point": "Lacks logical sequence; fragmented ideas without transitions or unity.",
+      "anchor_quote": "by passing through many hands",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "[Link to pearl's journey and final adornment].",
+      "comment": "Irrelevant ending; add transitions, evidence, analysis, and closing to unify paragraph."
+    }
+  ],
+  "page_suggestions": [
+    {
+      "page": 2,
+      "suggestions": [
+        "Expand summary to include key events: oyster incident, pearl formation, drop's reflection, and final crown status.",
+        "Correct garbled phrasing for grammatical clarity and coherence.",
+        "Organize into logical paragraph structure with topic sentence, progression, and closing.",
+        "Increase length substantially to match allocated marks (currently ~12 words)."
+      ]
+    }
+  ],
+  "annotation_errors": [],
+  "extra_text_json_path": ".\\extra_text.json",
+  "model_config": {
+    "grading": {
+      "model": "grok-4-1-fast-reasoning",
+      "temperature": 0.1
+    },
+    "annotations": {
+      "model": "grok-4-1-fast-reasoning",
+      "temperature": 0.15
+    },
+    "json_repair": {
+      "model": "grok-4-1-fast-reasoning",
+      "temperature": 0.0
+    }
+  }
+}

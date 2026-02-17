@@ -1,0 +1,10 @@
+# Core dependencies
+PyMuPDF
+numpy
+Pillow
+opencv-python
+requests
+python-dotenv
+azure-ai-formrecognizer
+azure-core
+python-docx
