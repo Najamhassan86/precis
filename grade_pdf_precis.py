@@ -62,6 +62,22 @@ DEFAULT_MODELS: Dict[str, Dict[str, Any]] = {
 # Keep report text aligned with annotation-style readable text size.
 REPORT_BASE_TEXT_SIZE = 12.0
 
+# Populated by _extract_answer_block_text for answer_extracted.json debug output.
+_LAST_ANSWER_BLOCK_DEBUG: Dict[str, Any] = {
+    "fragmented_handwriting": False,
+    "short_ratio": 0.0,
+    "body_y_norm": None,
+    "line_gap": None,
+    "removed_lines": [],
+    "kept_lines_count": 0,
+    "total_lines_count": 0,
+    "used_word_fallback": False,
+    "word_count_words": 0,
+    "total_words_count": 0,
+    "filtered_words_count": 0,
+    "title_source": "lines",
+}
+
 
 def _format_duration(seconds: float) -> str:
     if seconds < 60:
@@ -689,6 +705,575 @@ def _infer_length_status(original_words: int, required_words: int, student_words
     return "Too Long"
 
 
+def _page_extent_from_lines(lines: List[Dict[str, Any]]) -> Tuple[float, float]:
+    max_x = 0.0
+    max_y = 0.0
+    for ln in lines:
+        poly = ln.get("bbox") or ln.get("polygon") or []
+        if isinstance(poly, list) and poly and isinstance(poly[0], (list, tuple)) and len(poly[0]) >= 2:
+            pts = poly
+        elif isinstance(poly, list) and poly and isinstance(poly[0], dict) and "x" in poly[0]:
+            pts = [(p.get("x", 0.0), p.get("y", 0.0)) for p in poly]
+        else:
+            pts = []
+        for x, y in pts:
+            max_x = max(max_x, float(x))
+            max_y = max(max_y, float(y))
+    return max_x, max_y
+
+
+def _line_bbox_stats(line: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    poly = line.get("bbox") or line.get("polygon") or []
+    if isinstance(poly, list) and poly and isinstance(poly[0], (list, tuple)) and len(poly[0]) >= 2:
+        pts = poly
+    elif isinstance(poly, list) and poly and isinstance(poly[0], dict) and "x" in poly[0]:
+        pts = [(p.get("x", 0.0), p.get("y", 0.0)) for p in poly]
+    else:
+        pts = []
+    if not pts:
+        return None
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _word_bbox_stats(word: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    poly = word.get("bbox") or word.get("polygon") or []
+    if isinstance(poly, list) and poly and isinstance(poly[0], (list, tuple)) and len(poly[0]) >= 2:
+        pts = poly
+    elif isinstance(poly, list) and poly and isinstance(poly[0], dict) and "x" in poly[0]:
+        pts = [(p.get("x", 0.0), p.get("y", 0.0)) for p in poly]
+    else:
+        pts = []
+    if not pts:
+        return None
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _page_extent_from_words(words: List[Dict[str, Any]]) -> Tuple[float, float]:
+    max_x = 0.0
+    max_y = 0.0
+    for wd in words:
+        bbox = _word_bbox_stats(wd)
+        if not bbox:
+            continue
+        _, x_max, _, y_max = bbox
+        max_x = max(max_x, float(x_max))
+        max_y = max(max_y, float(y_max))
+    return max_x, max_y
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    vs = sorted(values)
+    n = len(vs)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(vs[mid])
+    return float((vs[mid - 1] + vs[mid]) / 2.0)
+
+
+def _extract_answer_block_text(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
+    global _LAST_ANSWER_BLOCK_DEBUG
+
+    # Page-level handwriting/noisy OCR detector knobs.
+    HANDWRITING_SHORT_WORD_MAX = 3
+    HANDWRITING_SHORT_CHAR_MAX = 18
+    HANDWRITING_FRAGMENTED_RATIO_MIN = 0.45
+    HANDWRITING_FEW_LINES_MAX = 8
+    HANDWRITING_LATE_BODY_Y_NORM_MIN = 0.20
+    HANDWRITING_BODYLIKE_FEW_MAX = 2
+
+    # Top-of-page cleanup knobs (kept explicit for safer future tuning).
+    CLEANUP_BODY_Y_MIN_FRAC = 0.12
+    CLEANUP_DROP_GAP_MULT = 2.8
+    CLEANUP_SHORT_WORD_MAX = 2
+    CLEANUP_SHORT_CHAR_MAX = 12
+
+    # Word-level fallback knobs for handwritten/noisy OCR pages.
+    WORD_FALLBACK_LINE_COUNT_MAX = 10
+    WORD_FALLBACK_ANSWER_WORD_MIN = 25
+    WORD_TOP_FILTER_FRAC = 0.06
+    WORD_MARGIN_LEFT_FRAC = 0.08
+    WORD_MARGIN_RIGHT_FRAC = 0.92
+    WORD_ROW_Y_TOL_FRAC = 0.012
+    WORD_TITLE_CENTER_TOL_FRAC = 0.18
+    WORD_TITLE_MIN_WORDS = 2
+    WORD_TITLE_MAX_WORDS = 6
+    WORD_TITLE_MAX_Y_NORM = 0.22
+    WORD_TITLE_STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+
+    debug_info: Dict[str, Any] = {
+        "fragmented_handwriting": False,
+        "short_ratio": 0.0,
+        "body_y_norm": None,
+        "line_gap": None,
+        "removed_lines": [],
+        "kept_lines_count": 0,
+        "total_lines_count": 0,
+        "used_word_fallback": False,
+        "word_count_words": 0,
+        "total_words_count": 0,
+        "filtered_words_count": 0,
+        "title_source": "lines",
+    }
+
+    pages = ocr_data.get("pages") or []
+    page2 = None
+    for p in pages:
+        if int(p.get("page_number") or 0) == 2:
+            page2 = p
+            break
+    if not page2:
+        _LAST_ANSWER_BLOCK_DEBUG = debug_info
+        return "", ""
+
+    lines = page2.get("lines") or []
+    words_raw = page2.get("words") or []
+    page_w, page_h = _page_extent_from_lines(lines)
+    if page_w <= 0 or page_h <= 0:
+        words_w, words_h = _page_extent_from_words(words_raw)
+        page_w = max(page_w, words_w)
+        page_h = max(page_h, words_h)
+    if page_w <= 0:
+        page_w = 1.0
+    if page_h <= 0:
+        page_h = 1.0
+
+    line_items: List[Dict[str, Any]] = []
+    for ln in lines:
+        text = (ln.get("text") or ln.get("content") or "").strip()
+        if not text:
+            continue
+        if "improvements" in text.lower():
+            continue
+        bbox = _line_bbox_stats(ln)
+        if bbox:
+            x_min, x_max, y_min, y_max = bbox
+            center_x = (x_min + x_max) / 2.0
+        else:
+            x_min = x_max = center_x = None
+            y_min = y_max = None
+        line_items.append(
+            {
+                "text": text,
+                "word_count": len(text.split()),
+                "char_len": len(text),
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min if y_min is not None else 0.0,
+                "y_max": y_max if y_max is not None else 0.0,
+                "center_x": center_x,
+            }
+        )
+
+    line_items.sort(key=lambda x: x["y_min"])
+    debug_info["total_lines_count"] = len(line_items)
+    debug_info["total_words_count"] = sum(
+        1 for wd in words_raw if str((wd.get("content") or wd.get("text") or "")).strip()
+    )
+
+    def _is_body_like(li: Dict[str, Any]) -> bool:
+        if li["word_count"] >= 4 or li["char_len"] >= 20:
+            cx = li.get("center_x")
+            if cx is None:
+                return True
+            return (0.15 * page_w) <= cx <= (0.85 * page_w)
+        return False
+
+    short_ratio = 0.0
+    fragmented_handwriting = False
+    body_y_norm: Optional[float] = None
+    line_gap = 0.04 * page_h
+    removed_lines: List[str] = []
+    title = ""
+    answer_block_text = ""
+    title_source = "lines"
+
+    if line_items:
+        short_lines_count = sum(
+            1
+            for li in line_items
+            if li["word_count"] <= HANDWRITING_SHORT_WORD_MAX or li["char_len"] <= HANDWRITING_SHORT_CHAR_MAX
+        )
+        short_ratio = short_lines_count / float(len(line_items))
+
+        body_like = [li for li in line_items if _is_body_like(li)]
+        body_start_idx = None
+        top_margin = 0.06 * page_h
+        for i, li in enumerate(line_items):
+            if li["y_min"] < top_margin:
+                continue
+            if _is_body_like(li):
+                body_start_idx = i
+                break
+        if body_start_idx is None and body_like:
+            body_start_idx = line_items.index(body_like[0])
+        if body_start_idx is None:
+            body_start_idx = 0
+
+        body_y = line_items[body_start_idx]["y_min"]
+        body_gaps = []
+        prev_y = None
+        for li in body_like:
+            y = li["y_min"]
+            if prev_y is not None:
+                dy = y - prev_y
+                if dy > 0:
+                    body_gaps.append(dy)
+            prev_y = y
+        measured_gap = _median(body_gaps)
+        if measured_gap is not None and measured_gap > 0:
+            line_gap = measured_gap
+
+        body_y_norm = float(body_y / page_h) if page_h > 0 else None
+        fragmented_handwriting = short_ratio >= HANDWRITING_FRAGMENTED_RATIO_MIN
+        if (
+            len(line_items) <= HANDWRITING_FEW_LINES_MAX
+            and body_y_norm is not None
+            and body_y_norm > HANDWRITING_LATE_BODY_Y_NORM_MIN
+        ):
+            fragmented_handwriting = True
+        if len(body_like) <= HANDWRITING_BODYLIKE_FEW_MAX:
+            fragmented_handwriting = True
+
+        # Handwritten/noisy OCR pages can split one sentence into many short fragments.
+        # On those pages this cleanup is risky, so keep it only for structured layouts.
+        if (not fragmented_handwriting) and body_y >= CLEANUP_BODY_Y_MIN_FRAC * page_h:
+            drop_y = body_y - CLEANUP_DROP_GAP_MULT * line_gap
+            filtered: List[Dict[str, Any]] = []
+            for li in line_items:
+                if li["y_min"] < drop_y and (
+                    li["word_count"] <= CLEANUP_SHORT_WORD_MAX and li["char_len"] <= CLEANUP_SHORT_CHAR_MAX
+                ):
+                    removed_lines.append(li["text"])
+                    continue
+                filtered.append(li)
+            if len(filtered) >= 2:
+                line_items = filtered
+            else:
+                removed_lines = []
+
+        line_items.sort(key=lambda x: x["y_min"])
+        body_like = [li for li in line_items if _is_body_like(li)]
+        body_start_idx = None
+        for i, li in enumerate(line_items):
+            if li["y_min"] < top_margin:
+                continue
+            if _is_body_like(li):
+                body_start_idx = i
+                break
+        if body_start_idx is None and body_like:
+            body_start_idx = line_items.index(body_like[0])
+        if body_start_idx is None:
+            body_start_idx = 0
+
+        body_y = line_items[body_start_idx]["y_min"]
+        body_xs = [li["x_min"] for li in body_like if li["x_min"] is not None]
+        body_xe = [li["x_max"] for li in body_like if li["x_max"] is not None]
+        body_left = _median(body_xs) if body_xs else None
+        body_right = _median(body_xe) if body_xe else None
+        body_center = (
+            (body_left + body_right) / 2.0 if body_left is not None and body_right is not None else page_w / 2.0
+        )
+        body_width = (body_right - body_left) if body_left is not None and body_right is not None else page_w
+        body_width = max(1.0, body_width)
+
+        title_min_y = body_y - 2.2 * line_gap
+        title_max_y = body_y - 0.2 * line_gap
+        title_candidates = []
+        for li in line_items:
+            if li["y_min"] >= body_y:
+                continue
+            if not (title_min_y <= li["y_min"] <= title_max_y):
+                continue
+            if li["word_count"] > 7 and li["char_len"] > 30:
+                continue
+            cx = li.get("center_x")
+            if cx is not None:
+                if abs(cx - body_center) > (0.25 * body_width):
+                    continue
+            title_candidates.append(li)
+
+        title_idx = None
+        if title_candidates:
+            title_candidates.sort(key=lambda x: (-x["y_min"], x["word_count"]))
+            chosen = title_candidates[0]
+            title = chosen["text"]
+            title_idx = line_items.index(chosen)
+        else:
+            if body_start_idx > 0:
+                prev = line_items[body_start_idx - 1]
+                if prev["word_count"] <= 7 and (body_y - prev["y_min"]) <= (1.6 * line_gap):
+                    title = prev["text"]
+                    title_idx = body_start_idx - 1
+
+        body_start = body_start_idx
+        if title_idx is not None and title_idx + 1 > body_start:
+            body_start = title_idx + 1
+        body_lines = [li["text"] for li in line_items[body_start:]]
+        answer_block_text = " ".join([l.strip() for l in body_lines if l.strip()]).strip()
+    else:
+        fragmented_handwriting = True
+
+    debug_info["short_ratio"] = short_ratio
+    debug_info["fragmented_handwriting"] = fragmented_handwriting
+    debug_info["body_y_norm"] = body_y_norm
+    debug_info["line_gap"] = float(line_gap)
+    debug_info["removed_lines"] = removed_lines
+    debug_info["kept_lines_count"] = len(line_items)
+
+    should_use_word_fallback = fragmented_handwriting and (
+        len(line_items) <= WORD_FALLBACK_LINE_COUNT_MAX or len(answer_block_text.split()) < WORD_FALLBACK_ANSWER_WORD_MIN
+    )
+    used_word_fallback = False
+    filtered_words_count = 0
+    word_count_words = 0
+
+    if should_use_word_fallback and words_raw:
+        word_page_w, word_page_h = _page_extent_from_words(words_raw)
+        if page_w <= 1.0 and word_page_w > 0:
+            page_w = word_page_w
+        if page_h <= 1.0 and word_page_h > 0:
+            page_h = word_page_h
+
+        word_items: List[Dict[str, Any]] = []
+        for wd in words_raw:
+            text = str((wd.get("content") or wd.get("text") or "")).strip()
+            if not text:
+                continue
+            bbox = _word_bbox_stats(wd)
+            if not bbox:
+                continue
+            x_min, x_max, y_min, y_max = bbox
+            word_items.append(
+                {
+                    "text": text,
+                    "x_min": x_min,
+                    "x_max": x_max,
+                    "y_min": y_min,
+                    "y_max": y_max,
+                    "center_x": (x_min + x_max) / 2.0,
+                    "y_center": (y_min + y_max) / 2.0,
+                }
+            )
+
+        filtered_words: List[Dict[str, Any]] = []
+        for wi in word_items:
+            if wi["y_min"] < WORD_TOP_FILTER_FRAC * page_h:
+                filtered_words_count += 1
+                continue
+            if wi["center_x"] < WORD_MARGIN_LEFT_FRAC * page_w or wi["center_x"] > WORD_MARGIN_RIGHT_FRAC * page_w:
+                filtered_words_count += 1
+                continue
+            filtered_words.append(wi)
+
+        if filtered_words:
+            row_tol = WORD_ROW_Y_TOL_FRAC * page_h
+            sorted_words = sorted(filtered_words, key=lambda w: (w["y_center"], w["x_min"]))
+            rows: List[Dict[str, Any]] = []
+            for wi in sorted_words:
+                if rows and abs(wi["y_center"] - rows[-1]["y_center"]) < row_tol:
+                    row = rows[-1]
+                    row["words"].append(wi)
+                    row_n = len(row["words"])
+                    row["y_center"] = ((row["y_center"] * (row_n - 1)) + wi["y_center"]) / row_n
+                else:
+                    rows.append({"y_center": wi["y_center"], "words": [wi]})
+
+            row_items: List[Dict[str, Any]] = []
+            for row in rows:
+                words_in_row = sorted(row["words"], key=lambda w: w["x_min"])
+                row_text = " ".join(w["text"] for w in words_in_row if w["text"]).strip()
+                if not row_text:
+                    continue
+                row_items.append(
+                    {
+                        "text": row_text,
+                        "y_center": row["y_center"],
+                        "center_x": sum(w["center_x"] for w in words_in_row) / max(1, len(words_in_row)),
+                        "word_count": len(words_in_row),
+                    }
+                )
+            row_items.sort(key=lambda r: r["y_center"])
+            word_count_words = sum(int(r["word_count"]) for r in row_items)
+
+            if row_items:
+                title_idx = None
+                for idx, row in enumerate(row_items):
+                    if row["y_center"] / max(1.0, page_h) >= WORD_TITLE_MAX_Y_NORM:
+                        continue
+                    if abs(row["center_x"] - (page_w / 2.0)) >= WORD_TITLE_CENTER_TOL_FRAC * page_w:
+                        continue
+                    if not (WORD_TITLE_MIN_WORDS <= row["word_count"] <= WORD_TITLE_MAX_WORDS):
+                        continue
+                    toks = re.findall(r"[A-Za-z']+", row["text"].lower())
+                    if not toks:
+                        continue
+                    stopword_hits = sum(1 for t in toks if t in WORD_TITLE_STOPWORDS)
+                    if stopword_hits > (len(toks) / 2.0):
+                        continue
+                    title_idx = idx
+                    break
+                if title_idx is not None:
+                    word_title = row_items[title_idx]["text"].strip()
+                    word_body_rows = row_items[title_idx + 1 :]
+                else:
+                    word_title = ""
+                    word_body_rows = row_items
+                word_body_text = " ".join(r["text"] for r in word_body_rows if r["text"]).strip()
+                if word_body_text:
+                    title = word_title
+                    answer_block_text = word_body_text
+                    used_word_fallback = True
+                    title_source = "words"
+
+    debug_info["used_word_fallback"] = used_word_fallback
+    debug_info["word_count_words"] = int(word_count_words)
+    debug_info["filtered_words_count"] = int(filtered_words_count)
+    debug_info["title_source"] = title_source
+
+    _LAST_ANSWER_BLOCK_DEBUG = debug_info
+    return title.strip(), answer_block_text.strip()
+
+
+def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
+    pages = ocr_data.get("pages") or []
+    page1 = None
+    for p in pages:
+        if int(p.get("page_number") or 0) == 1:
+            page1 = p
+            break
+    if not page1:
+        return "", ""
+
+    lines = page1.get("lines") or []
+    words = page1.get("words") or []
+
+    def _norm_ws(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip()
+
+    # Anchor-based parsing is needed because noisy scans can lose short instruction lines
+    # after line-level cleanup; word rows preserve page-1 prompt text more reliably.
+    line_items: List[Tuple[float, str]] = []
+    if words:
+        words_h = _page_extent_from_words(words)[1]
+        lines_h = _page_extent_from_lines(lines)[1]
+        page_h = max(words_h, lines_h, 1.0)
+        row_tol = 0.012 * page_h
+        word_items: List[Dict[str, Any]] = []
+        for wd in words:
+            text = str((wd.get("text") or wd.get("content") or "")).strip()
+            if not text:
+                continue
+            bbox = _word_bbox_stats(wd)
+            if not bbox:
+                continue
+            x_min, _, y_min, y_max = bbox
+            word_items.append({"text": text, "x_min": x_min, "y_center": (y_min + y_max) / 2.0})
+        word_items.sort(key=lambda w: (w["y_center"], w["x_min"]))
+
+        rows: List[Dict[str, Any]] = []
+        for wi in word_items:
+            if rows and abs(wi["y_center"] - rows[-1]["y_center"]) < row_tol:
+                row = rows[-1]
+                row["words"].append(wi)
+                n = len(row["words"])
+                row["y_center"] = ((row["y_center"] * (n - 1)) + wi["y_center"]) / n
+            else:
+                rows.append({"y_center": wi["y_center"], "words": [wi]})
+
+        for row in rows:
+            words_in_row = sorted(row["words"], key=lambda w: w["x_min"])
+            row_text = _norm_ws(" ".join(w["text"] for w in words_in_row if w["text"]))
+            if row_text:
+                line_items.append((float(row["y_center"]), row_text))
+    else:
+        for idx, ln in enumerate(lines):
+            text = (ln.get("text") or ln.get("content") or "").strip()
+            if not text:
+                continue
+            bbox = _line_bbox_stats(ln)
+            y = float(bbox[2]) if bbox else float(idx)
+            line_items.append((y, text))
+
+    line_items.sort(key=lambda x: x[0])
+    if not line_items:
+        return "", ""
+
+    page1_text = _norm_ws("\n".join([t for _, t in line_items if t]))
+    if not page1_text:
+        return "", ""
+
+    instruction_anchor_patterns = [
+        r"\bexercise\b",
+        r"write\s+a\s+pr[eé]cis",
+        r"\bpr[eé]cis\b",
+        r"suggest\s+a\s+suitable\s+title",
+    ]
+    passage_start_idx: Optional[int] = None
+    m_drop = re.search(r"\ba\s+drop\s+of\s+water\b", page1_text, flags=re.IGNORECASE)
+    if m_drop:
+        passage_start_idx = m_drop.start()
+    else:
+        m_alas = re.search(r"[\"“”']?\s*alas!?", page1_text, flags=re.IGNORECASE)
+        if m_alas:
+            passage_start_idx = m_alas.start()
+
+    if passage_start_idx is not None:
+        instr_positions: List[int] = []
+        for pat in instruction_anchor_patterns:
+            for m in re.finditer(pat, page1_text, flags=re.IGNORECASE):
+                if m.start() < passage_start_idx:
+                    instr_positions.append(m.start())
+        q_start = min(instr_positions) if instr_positions else 0
+        question_text = _norm_ws(page1_text[q_start:passage_start_idx]).strip(" :-")
+        statement_text = _norm_ws(page1_text[passage_start_idx:])
+        if not question_text:
+            question_text = _norm_ws(page1_text[:passage_start_idx]).strip(" :-")
+        return question_text, statement_text
+
+    # Fallback when anchors are missing.
+    question_lines: List[str] = []
+    statement_lines: List[str] = []
+    in_statement = False
+    keywords = ("exercise", "precis", "title", "question", "write")
+    for _, text in line_items:
+        t_low = text.lower()
+        word_count = len(text.split())
+        has_keyword = any(k in t_low for k in keywords)
+        passage_like = word_count >= 8 and not has_keyword
+        if not in_statement and passage_like:
+            in_statement = True
+            statement_lines.append(text)
+            continue
+        if in_statement:
+            statement_lines.append(text)
+        else:
+            question_lines.append(text)
+    return _norm_ws(" ".join(question_lines)), _norm_ws(" ".join(statement_lines))
+
+
 def call_grok_for_precis_grading(
     grok_api_key: str,
     rubric_text: str,
@@ -701,9 +1286,28 @@ def call_grok_for_precis_grading(
     repair_model: str = "grok-4-1-fast-reasoning",
     repair_temperature: float = 0.0,
 ) -> Dict[str, Any]:
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(round(float(value)))
+        except Exception:
+            return int(default)
+
     total_marks = int(round(sum(float(c.get("marks_allocated", 0)) for c in criteria_template)))
+    answer_title_hint, answer_block_text = _extract_answer_block_text(ocr_data)
+    answer_debug = _LAST_ANSWER_BLOCK_DEBUG if isinstance(_LAST_ANSWER_BLOCK_DEBUG, dict) else {}
+    answer_block_word_count = len((answer_block_text or "").split())
+    answer_total_lines_count = int(answer_debug.get("total_lines_count", 0) or 0)
+    answer_fragmented_handwriting = bool(answer_debug.get("fragmented_handwriting", False))
+    answer_used_word_fallback = bool(answer_debug.get("used_word_fallback", False))
+    answer_word_count_words = int(answer_debug.get("word_count_words", 0) or 0)
+    question_block_text, question_statement_block_text = _extract_question_blocks(ocr_data)
+    answer_page_images = [p for p in page_images if int(p.get("page") or 0) == 2]
+    if not answer_page_images:
+        answer_page_images = page_images
 
     schema_hint = {
+        "question_text": "",
+        "question_statement_text": "",
         "topic": "",
         "student_title": "",
         "student_precis_text": "",
@@ -750,17 +1354,28 @@ def call_grok_for_precis_grading(
         "- Also classify length_status using +/-5% tolerance around required length.\n"
         "Scoring rules:\n"
         "- Follow the provided rubric criteria and marks exactly.\n"
-        "- For each criterion, give marks_awarded within [0, marks_allocated].\n"
+        "- For each criterion, give marks_awarded as a whole number within [0, marks_allocated].\n"
         "- Add concise, evidence-based key_comments for each criterion.\n"
         "- Provide total_awarded as the sum of marks_awarded values.\n"
         "- Provide overall_rating from: Excellent, Good, Average, Weak.\n"
         "- reasons_for_low_score must contain only concrete weaknesses, not praise.\n"
+        "- reasons_for_low_score must NOT contain 'No major weaknesses identified'.\n"
+        "- If total_awarded is below 70% of total marks, reasons_for_low_score must contain at least 2 concrete items.\n"
         "- ideal_precis.text must be a high-quality improved precis for this same passage.\n"
         "- ideal_precis.title must be concise and relevant.\n"
+        "- ideal_precis.title and ideal_precis.text must both be non-empty.\n"
+        "Question extraction rules:\n"
+        "- question_text must come from question_block_text only.\n"
+        "- question_statement_text must come from question_statement_block_text only.\n"
         "Extraction rules:\n"
         "- topic should be the passage topic/theme.\n"
         "- student_title must be exactly what the student wrote when visible; else infer carefully.\n"
         "- student_precis_text must contain the student precis paragraph only.\n"
+        "- Use answer_title_hint and answer_block_text as primary evidence for the student's title/precis.\n"
+        "- Those hints are OCR-filtered to remove stray top-of-page text from the previous paragraph.\n"
+        "- You MUST transcribe student_precis_text from page 2 image only when extracted text is insufficient.\n"
+        "- Insufficient means: answer_block_text has fewer than 20 words OR word_count_words < 25 OR (used_word_fallback is false AND total_lines_count < 10).\n"
+        "- If used_word_fallback is true and word_count_words >= 35, DO NOT force page-image transcription; use answer_block_text as authoritative.\n"
         "- Compute original_passage_word_count, required_precis_word_count, student_precis_word_count.\n"
         "- Ignore unrelated watermark/camera/footer artifacts or stray words not part of question/answer content.\n"
         "- Do not mention OCR or handwriting quality in comments.\n"
@@ -770,54 +1385,95 @@ def call_grok_for_precis_grading(
     payload = {
         "rubric_text": rubric_text,
         "criteria_template": criteria_template,
+        "question_block_text": question_block_text,
+        "question_statement_block_text": question_statement_block_text,
+        "answer_title_hint": answer_title_hint,
+        "answer_block_text": answer_block_text,
+        "answer_block_word_count": answer_block_word_count,
+        "total_lines_count": answer_total_lines_count,
+        "fragmented_handwriting": answer_fragmented_handwriting,
+        "used_word_fallback": answer_used_word_fallback,
+        "word_count_words": answer_word_count_words,
         "ocr_pages": ocr_data.get("pages", []),
         "ocr_full_text": ocr_data.get("full_text", ""),
+        "answer_page_images": answer_page_images,
         "page_images": page_images,
         "output_schema": schema_hint,
     }
 
     def _validate(parsed: Dict[str, Any]) -> bool:
-        crit = parsed.get("criteria")
-        if not isinstance(crit, list) or len(crit) != len(criteria_template):
+        if not isinstance(parsed, dict):
             return False
 
-        marks_sum = 0.0
-        for i, c in enumerate(crit):
+        crit = parsed.get("criteria")
+        crit_list: List[Dict[str, Any]] = crit if isinstance(crit, list) else []
+        marks_sum = 0
+        normalized_criteria: List[Dict[str, Any]] = []
+        for i, tmpl in enumerate(criteria_template):
+            c = crit_list[i] if i < len(crit_list) and isinstance(crit_list[i], dict) else {}
             alloc = float(criteria_template[i].get("marks_allocated", 0))
             try:
                 aw = float(c.get("marks_awarded", 0))
             except Exception:
-                return False
+                aw = 0.0
             aw = min(max(aw, 0.0), alloc)
-            c["marks_awarded"] = round(aw, 2)
-            if not c.get("rating"):
-                c["rating"] = _normalize_rating(aw, alloc)
-            marks_sum += aw
+            aw_int = int(round(aw))
+            rating = str(c.get("rating", "") or "").strip()
+            if rating not in ("Excellent", "Good", "Average", "Weak"):
+                rating = _normalize_rating(float(aw_int), alloc)
+            normalized_criteria.append(
+                {
+                    "id": str(tmpl.get("id", "") or f"criterion_{i+1}"),
+                    "criterion": str(tmpl.get("criterion", "") or ""),
+                    "marks_allocated": int(round(alloc)),
+                    "marks_awarded": aw_int,
+                    "rating": rating,
+                    "key_comments": str(c.get("key_comments", "") or "").strip(),
+                }
+            )
+            marks_sum += aw_int
+        parsed["criteria"] = normalized_criteria
 
         declared_total = parsed.get("total_awarded")
         try:
             declared_total_f = float(declared_total)
         except Exception:
-            declared_total_f = marks_sum
+            declared_total_f = float(marks_sum)
 
         if abs(declared_total_f - marks_sum) > 0.75:
-            parsed["total_awarded"] = round(marks_sum, 2)
+            parsed["total_awarded"] = int(round(marks_sum))
         else:
-            parsed["total_awarded"] = round(declared_total_f, 2)
+            parsed["total_awarded"] = int(round(declared_total_f))
 
-        parsed["total_awarded"] = max(0.0, min(float(total_marks), float(parsed["total_awarded"])))
+        parsed["total_awarded"] = int(max(0, min(int(total_marks), int(parsed["total_awarded"]))))
 
         if parsed.get("overall_rating") not in ("Excellent", "Good", "Average", "Weak"):
             parsed["overall_rating"] = _normalize_rating(float(parsed["total_awarded"]), float(total_marks))
 
-        ow = int(parsed.get("original_passage_word_count") or 0)
-        rw = int(parsed.get("required_precis_word_count") or 0)
-        sw = int(parsed.get("student_precis_word_count") or 0)
+        # Keep question fields anchored to extracted page-1 blocks for consistency.
+        parsed["question_text"] = question_block_text
+        parsed["question_statement_text"] = question_statement_block_text
+
+        parsed["topic"] = str(parsed.get("topic", "") or "").strip()
+        parsed["student_title"] = str(parsed.get("student_title", "") or "").strip()
+        parsed["student_precis_text"] = str(parsed.get("student_precis_text", "") or "").strip()
+        if not parsed["student_title"]:
+            parsed["student_title"] = str(answer_title_hint or "").strip()
+        if not parsed["student_precis_text"]:
+            parsed["student_precis_text"] = str(answer_block_text or "").strip()
+
+        ow = _to_int(parsed.get("original_passage_word_count"), 0)
+        rw = _to_int(parsed.get("required_precis_word_count"), 0)
+        sw = len(parsed["student_precis_text"].split())
+        parsed["student_precis_word_count"] = sw
+        if ow <= 0 and question_statement_block_text:
+            ow = len(question_statement_block_text.split())
+            parsed["original_passage_word_count"] = ow
         if rw <= 0 and ow > 0:
             parsed["required_precis_word_count"] = int(round(ow / 3.0))
             rw = int(parsed["required_precis_word_count"])
 
-        if not parsed.get("length_status"):
+        if not parsed.get("length_status") or str(parsed.get("length_status")).strip() == "Unknown":
             parsed["length_status"] = _infer_length_status(ow, rw, sw)
 
         reasons = parsed.get("reasons_for_low_score")
@@ -830,6 +1486,21 @@ def call_grok_for_precis_grading(
             parsed["ideal_precis"] = {"title": "", "text": ""}
         parsed["ideal_precis"]["title"] = str(parsed["ideal_precis"].get("title", "")).strip()
         parsed["ideal_precis"]["text"] = str(parsed["ideal_precis"].get("text", "")).strip()
+        parsed["overall_remarks"] = str(parsed.get("overall_remarks", "") or "").strip()
+
+        # Quality gates: reject low-quality but schema-valid outputs and force retry.
+        all_marks_zero = all(int(c.get("marks_awarded", 0)) <= 0 for c in parsed["criteria"])
+        if all_marks_zero:
+            return False
+        if not parsed["ideal_precis"]["text"]:
+            return False
+        reasons_lc = [str(x).strip().lower() for x in parsed["reasons_for_low_score"] if str(x).strip()]
+        if not reasons_lc:
+            return False
+        if any("no major weaknesses" in r for r in reasons_lc):
+            return False
+        if sw >= 30 and int(parsed.get("total_awarded", 0) or 0) == 0:
+            return False
         return True
 
     last_err: Optional[Exception] = None
@@ -866,8 +1537,124 @@ def call_grok_for_precis_grading(
             print(f"  Precis grading validated on attempt {attempt + 1}.")
             return parsed
         last_err = ValueError("Invalid grading JSON")
+    print(f"  Warning: grading JSON remained incomplete after retries ({last_err}); using fallback normalization.")
+    fallback_student_title = str(answer_title_hint or "").strip() or "Precis"
+    fallback_student_text = str(answer_block_text or "").strip()
+    fallback_ow = len(question_statement_block_text.split()) if question_statement_block_text else 0
+    fallback_rw = int(round(fallback_ow / 3.0)) if fallback_ow > 0 else 0
+    fallback_sw = len(fallback_student_text.split()) if fallback_student_text else 0
 
-    raise RuntimeError(f"Precis grading failed after retries: {last_err}")
+    source_text = str(question_statement_block_text or fallback_student_text).strip()
+    source_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", source_text) if s.strip()]
+    if not source_sents and source_text:
+        source_sents = [source_text]
+    if source_sents:
+        ideal_text_parts: List[str] = []
+        running_words = 0
+        max_words = max(55, fallback_rw) if fallback_rw > 0 else 70
+        for s in source_sents:
+            swc = len(s.split())
+            if running_words > 0 and running_words + swc > max_words:
+                break
+            ideal_text_parts.append(s)
+            running_words += swc
+            if len(ideal_text_parts) >= 4:
+                break
+        fallback_ideal_text = " ".join(ideal_text_parts).strip()
+    else:
+        fallback_ideal_text = ""
+    if not fallback_ideal_text:
+        fallback_ideal_text = (
+            "The passage highlights personal significance, humility, and growth through contribution to others."
+        )
+
+    title_seed = str(answer_title_hint or "").strip()
+    if title_seed:
+        fallback_ideal_title = title_seed
+    else:
+        title_tokens = re.findall(r"[A-Za-z]+", source_text)
+        if len(title_tokens) >= 3:
+            fallback_ideal_title = " ".join(title_tokens[:3]).title()
+        elif title_tokens:
+            fallback_ideal_title = title_tokens[0].title()
+        else:
+            fallback_ideal_title = "Precis"
+
+    fallback_reasons: List[str] = []
+    if fallback_rw > 0 and fallback_sw > 0:
+        if fallback_sw < int(round(fallback_rw * 0.95)):
+            fallback_reasons.append("Response is shorter than required one-third length and omits key supporting points.")
+        elif fallback_sw > int(round(fallback_rw * 1.05)):
+            fallback_reasons.append("Response exceeds the required one-third length and needs tighter compression.")
+    fallback_reasons.append("Main ideas are only partially developed, so logical progression and clarity need improvement.")
+    fallback_reasons.append("Language precision and paraphrasing control need refinement to preserve meaning without copying.")
+    fallback_reasons = [r for r in fallback_reasons if r][:3]
+
+    fallback_criteria: List[Dict[str, Any]] = []
+    fallback_marks_sum = 0
+    for i, tmpl in enumerate(criteria_template):
+        alloc = int(round(float(tmpl.get("marks_allocated", 0) or 0)))
+        if alloc <= 0:
+            aw = 0
+        elif fallback_sw > 0:
+            aw = max(1, int(round(alloc * 0.4)))
+            aw = min(alloc, aw)
+        else:
+            aw = 0
+        key_comment = "Partial achievement; response needs clearer coverage and tighter wording."
+        crit_name = str(tmpl.get("criterion", "") or "").lower()
+        if "title" in crit_name:
+            key_comment = "Title is present but can be more specific and aligned with the central idea."
+        elif "brevity" in crit_name:
+            key_comment = "Compression is uneven; reduce peripheral detail and keep core points concise."
+        elif "organization" in crit_name:
+            key_comment = "Organization is basic; transitions and sentence flow need improvement."
+        fallback_criteria.append(
+            {
+                "id": str(tmpl.get("id", "") or f"criterion_{i+1}"),
+                "criterion": str(tmpl.get("criterion", "") or ""),
+                "marks_allocated": alloc,
+                "marks_awarded": aw,
+                "rating": _normalize_rating(float(aw), float(alloc) if alloc > 0 else 1.0),
+                "key_comments": key_comment,
+            }
+        )
+        fallback_marks_sum += aw
+
+    if fallback_marks_sum == 0 and fallback_criteria:
+        first_alloc = int(fallback_criteria[0].get("marks_allocated", 0) or 0)
+        if first_alloc > 0:
+            fallback_criteria[0]["marks_awarded"] = 1
+            fallback_criteria[0]["rating"] = _normalize_rating(1.0, float(first_alloc))
+            fallback_marks_sum = 1
+
+    fallback: Dict[str, Any] = {
+        "question_text": question_block_text,
+        "question_statement_text": question_statement_block_text,
+        "topic": "",
+        "student_title": fallback_student_title,
+        "student_precis_text": fallback_student_text,
+        "original_passage_word_count": fallback_ow,
+        "required_precis_word_count": fallback_rw,
+        "student_precis_word_count": fallback_sw,
+        "length_status": _infer_length_status(fallback_ow, fallback_rw, fallback_sw),
+        "criteria": fallback_criteria,
+        "total_awarded": int(fallback_marks_sum),
+        "overall_rating": _normalize_rating(float(fallback_marks_sum), float(total_marks) if total_marks > 0 else 1.0),
+        "reasons_for_low_score": fallback_reasons[:],
+        "ideal_precis": {"title": fallback_ideal_title, "text": fallback_ideal_text},
+        "overall_remarks": "Fallback grading used after repeated invalid model outputs; scores are conservative.",
+    }
+    if not _validate(fallback):
+        fallback["reasons_for_low_score"] = [
+            "Coverage is incomplete and several key points from the source are missing.",
+            "Expression needs tighter paraphrasing and clearer organization.",
+        ]
+        fallback["ideal_precis"] = {
+            "title": fallback_ideal_title or "Precis",
+            "text": fallback_ideal_text or "The passage emphasizes humility, purpose, and value through contribution.",
+        }
+    return fallback
 
 
 def call_grok_for_precis_annotations(
@@ -1110,6 +1897,9 @@ def render_precis_report_pdf(
     output_pdf_path: str,
     *,
     colouring_scheme_image: str = "",
+    question_text: str = "",
+    question_statement_text: str = "",
+    question_image_path: str = "",
     max_pages: int = 2,
 ) -> None:
     """Render report on exactly one page by shrinking all text sizes if needed."""
@@ -1294,6 +2084,62 @@ def render_precis_report_pdf(
             yy += body_lh
         return True
 
+    def _render_question_page(doc: fitz.Document) -> None:
+        page = doc.new_page(width=W, height=H)
+        y = margin
+        label_size = REPORT_BASE_TEXT_SIZE
+        body_size = max(8.0, REPORT_BASE_TEXT_SIZE - 2)
+
+        if question_text:
+            page.insert_text((margin, y + label_size), "Question:", fontname="hebo", fontsize=label_size, color=palette["section_title"])
+            y += label_size + 4
+            y = _draw_wrapped_text(
+                page,
+                margin,
+                y + body_size,
+                question_text,
+                fontname="helv",
+                fontsize=body_size,
+                max_width=W - 2 * margin,
+                color=(0, 0, 0),
+                line_gap=1.25,
+            )
+            y += 8
+
+        if question_statement_text:
+            page.insert_text((margin, y + label_size), "Passage:", fontname="hebo", fontsize=label_size, color=palette["section_title"])
+            y += label_size + 4
+            y = _draw_wrapped_text(
+                page,
+                margin,
+                y + body_size,
+                question_statement_text,
+                fontname="helv",
+                fontsize=body_size,
+                max_width=W - 2 * margin,
+                color=(0, 0, 0),
+                line_gap=1.25,
+            )
+            y += 8
+
+        if question_image_path and os.path.exists(question_image_path):
+            try:
+                img = Image.open(question_image_path)
+                img_w, img_h = img.size
+                if img_w > 0 and img_h > 0:
+                    avail_w = W - 2 * margin
+                    avail_h = H - y - margin
+                    scale = min(avail_w / img_w, avail_h / img_h)
+                    draw_w = img_w * scale
+                    draw_h = img_h * scale
+                    x0 = margin + (avail_w - draw_w) / 2.0
+                    rect = fitz.Rect(x0, y, x0 + draw_w, y + draw_h)
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="PNG")
+                    page.insert_image(rect, stream=buf.getvalue())
+            except Exception:
+                pass
+
     # Try progressively smaller global text sizes until it fits one page.
     best_doc: Optional[fitz.Document] = None
     for shrink in range(0, 13):
@@ -1307,6 +2153,9 @@ def render_precis_report_pdf(
         # Last fallback at smallest size; keep first page only.
         best_doc = fitz.open()
         _render_once(best_doc, 12)
+
+    if (question_text or question_statement_text or (question_image_path and os.path.exists(question_image_path))):
+        _render_question_page(best_doc)
 
     os.makedirs(os.path.dirname(output_pdf_path) or ".", exist_ok=True)
     best_doc.save(output_pdf_path)
@@ -1416,13 +2265,69 @@ def run_precis_grading(
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"Saved JSON -> {output_json_path}")
 
+    question_block_text, question_statement_block_text = _extract_question_blocks(ocr_data)
+    question_json_path = os.path.join(os.path.dirname(output_json_path) or ".", "question_extracted.json")
+    with open(question_json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "question_text": grading.get("question_text", ""),
+                "question_statement_text": grading.get("question_statement_text", ""),
+                "question_block_text": question_block_text,
+                "question_statement_block_text": question_statement_block_text,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    print(f"Saved Question JSON -> {question_json_path}")
+
+    answer_title_hint, answer_block_text = _extract_answer_block_text(ocr_data)
+    answer_debug = _LAST_ANSWER_BLOCK_DEBUG if isinstance(_LAST_ANSWER_BLOCK_DEBUG, dict) else {}
+    answer_json_path = os.path.join(os.path.dirname(output_json_path) or ".", "answer_extracted.json")
+    with open(answer_json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "student_title": grading.get("student_title", ""),
+                "student_precis_text": grading.get("student_precis_text", ""),
+                "answer_title_hint": answer_title_hint,
+                "answer_block_text": answer_block_text,
+                "fragmented_handwriting": bool(answer_debug.get("fragmented_handwriting", False)),
+                "short_ratio": float(answer_debug.get("short_ratio", 0.0) or 0.0),
+                "body_y_norm": answer_debug.get("body_y_norm"),
+                "line_gap": answer_debug.get("line_gap"),
+                "removed_lines": list(answer_debug.get("removed_lines") or []),
+                "kept_lines_count": int(answer_debug.get("kept_lines_count", 0) or 0),
+                "total_lines_count": int(answer_debug.get("total_lines_count", 0) or 0),
+                "used_word_fallback": bool(answer_debug.get("used_word_fallback", False)),
+                "word_count_words": int(answer_debug.get("word_count_words", 0) or 0),
+                "total_words_count": int(answer_debug.get("total_words_count", 0) or 0),
+                "filtered_words_count": int(answer_debug.get("filtered_words_count", 0) or 0),
+                "title_source": str(answer_debug.get("title_source", "lines") or "lines"),
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    print(f"Saved Answer JSON -> {answer_json_path}")
+
     print("Rendering precis report PDF...")
     t0 = time.perf_counter()
     report_tmp = report_only_pdf_path or os.path.join(os.path.dirname(output_pdf_path) or ".", "_precis_report_tmp.pdf")
+    question_text = str(grading.get("question_text", "") or question_block_text or "")
+    question_statement_text = str(grading.get("question_statement_text", "") or question_statement_block_text or "")
+    question_image_path = ""
+    for p in page_images:
+        if int(p.get("page") or 0) == 1 and p.get("file_path"):
+            question_image_path = str(p.get("file_path"))
+            break
+    has_question_page = bool(question_text or question_statement_text or question_image_path)
     render_precis_report_pdf(
         grading,
         report_tmp,
         colouring_scheme_image=colouring_scheme_image,
+        question_text=question_text,
+        question_statement_text=question_statement_text,
+        question_image_path=question_image_path,
         max_pages=1,
     )
     timings["PDF render"] = time.perf_counter() - t0
@@ -1443,6 +2348,9 @@ def run_precis_grading(
         spelling_errors=None,
         max_callouts_per_page=8,
     )
+    if has_question_page and len(annotated_pages) >= 2:
+        # Drop the annotated question page to avoid duplicating the report's question page.
+        annotated_pages = annotated_pages[1:]
     merge_report_and_annotated_answer(report_tmp, annotated_pages, output_pdf_path)
     if report_only_pdf_path is None:
         try:

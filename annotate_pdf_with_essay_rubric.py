@@ -1000,7 +1000,7 @@ def annotate_pdf_essay_pages(
 
         # Canvas with margins (equal spacing on both sides of the essay body)
         # Previously: left=65% and right=35% of essay width, which left a visibly larger gap on the left.
-        side_margin_ratio = 0.35
+        side_margin_ratio = 0.40
         left_width = int(side_margin_ratio * orig_w)
         right_width = int(side_margin_ratio * orig_w)
         new_w = left_width + orig_w + right_width
@@ -1268,21 +1268,46 @@ def annotate_pdf_essay_pages(
             })
         resolved_callouts.sort(key=lambda x: x["y_sort"])
 
-        last_bottom_y = margin_px
         gap = 12
+        max_bottom = orig_h - margin_px
+        avail_h = max(1, max_bottom - margin_px)
 
-        for item in resolved_callouts:
+        def _total_height(h_scale: float, b_scale: float, line_gap: int) -> Tuple[int, List[int]]:
+            heights: List[int] = []
+            total = 0
+            for it in resolved_callouts:
+                h_h = _estimate_text_height(it["header"], h_scale, 2, box_w - 24, line_gap=line_gap)
+                b_h = _estimate_text_height(it["body"], b_scale, 2, box_w - 24, line_gap=line_gap)
+                box_h = h_h + b_h + 72
+                heights.append(box_h)
+                total += box_h
+            if heights:
+                total += gap * (len(heights) - 1)
+            return total, heights
+
+        header_scale = 1.35
+        body_scale = 1.25
+        l_gap = 20
+
+        # If boxes won't fit, step down scales until they do.
+        for step in range(6):
+            hs = header_scale - 0.05 * step
+            bs = body_scale - 0.05 * step
+            if hs < 1.05 or bs < 1.0:
+                break
+            total_h, box_heights = _total_height(hs, bs, l_gap)
+            if total_h <= avail_h:
+                header_scale = hs
+                body_scale = bs
+                break
+
+        _, box_heights = _total_height(header_scale, body_scale, l_gap)
+
+        last_bottom_y = margin_px
+        for item, box_h in zip(resolved_callouts, box_heights):
             rect = item["rect"]
             header = item["header"]
             body = item["body"]
-
-            header_scale = 1.05
-            body_scale = 1.00
-            l_gap = 16
-
-            h_h = _estimate_text_height(header, header_scale, 2, box_w - 24, line_gap=l_gap)
-            b_h = _estimate_text_height(body, body_scale, 2, box_w - 24, line_gap=l_gap)
-            box_h = h_h + b_h + 60
 
             bx1 = left_width + orig_w + margin_px
             bx2 = bx1 + box_w
@@ -1295,22 +1320,17 @@ def annotate_pdf_essay_pages(
             by2 = int(by1 + box_h)
 
             # Ensure box stays within page bounds
-            max_bottom = orig_h - margin_px
             if by2 > max_bottom:
-                # Try to move box up while respecting last_bottom_y
                 by2 = max_bottom
-                by1 = max(margin_px, last_bottom_y + gap, by2 - box_h)
-                # Constrain by2 again if by1 adjustment caused overflow
-                if by1 + box_h > max_bottom:
-                    by2 = max_bottom
-                    by1 = max(margin_px, last_bottom_y + gap)
+                by1 = max(margin_px, by2 - box_h)
 
             last_bottom_y = by2
 
             # highlight + connector only if rect exists
             cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-            _draw_wrapped_text(canvas, bx1 + 12, by1 + 24, header, header_scale, 2, box_w - 24, (0, 0, 255), line_gap=l_gap)
-            _draw_wrapped_text(canvas, bx1 + 12, by1 + 30 + h_h, body, body_scale, 2, box_w - 24, (0, 0, 0), line_gap=l_gap)
+            h_h = _estimate_text_height(header, header_scale, 2, box_w - 24, line_gap=l_gap)
+            _draw_wrapped_text(canvas, bx1 + 12, by1 + 28, header, header_scale, 2, box_w - 24, (0, 0, 255), line_gap=l_gap)
+            _draw_wrapped_text(canvas, bx1 + 12, by1 + 36 + h_h, body, body_scale, 2, box_w - 24, (0, 0, 0), line_gap=l_gap)
 
             # Intentionally omit on-page highlights/connectors to avoid overlaying essay content.
 

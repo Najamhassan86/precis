@@ -1,0 +1,4 @@
+{
+  "question_text": "and conciseness. Ung",
+  "question_statement_text": "By following these steps, you systematically transform a lengthy passage into a concise and coherent precis while preserving its main ideas and message. Following are the two is itself a examples; Exercise 1: Write a precis of the following passage and suggest a suitable title. A drop of water fell out of the cloud into the sea, and finding itself lost in such an immensity of fluid matter, broke out into the following reflection: \"Alas! What an inconsiderable creature am I in this prodigious ocean of waters. My existence is of no concern in the universe; I am reduced to a kind of nothing, and I am the least of the works of God\". It so happened that an oyster which lay in the neighbourhood of this drop chanced to gape and swallow it"
+}
