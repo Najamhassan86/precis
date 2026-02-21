@@ -22,24 +22,48 @@ from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
 from dotenv import load_dotenv
 
+add_spelling_annotations_to_merged_pdf = None  # type: Optional[Any]
 try:
-    from annotate_pdf_with_essay_rubric import annotate_pdf_essay_pages  # type: ignore
+    from annotate_pdf_with_precis import annotate_pdf_essay_pages, add_spelling_annotations_to_merged_pdf  # type: ignore
 except Exception:
     try:
         parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ann_path = os.path.join(parent_dir, "annotate_pdf_with_essay_rubric.py")
+        ann_path = os.path.join(parent_dir, "annotate_pdf_with_precis.py")
         if os.path.exists(ann_path):
-            spec = importlib.util.spec_from_file_location("annotate_pdf_with_essay_rubric", ann_path)
+            spec = importlib.util.spec_from_file_location("annotate_pdf_with_precis", ann_path)
             mod = importlib.util.module_from_spec(spec) if spec else None
             if spec and spec.loader and mod:
                 spec.loader.exec_module(mod)
                 annotate_pdf_essay_pages = mod.annotate_pdf_essay_pages  # type: ignore
+                add_spelling_annotations_to_merged_pdf = getattr(mod, "add_spelling_annotations_to_merged_pdf", None)  # type: ignore
             else:
                 annotate_pdf_essay_pages = None  # type: ignore
         else:
             annotate_pdf_essay_pages = None  # type: ignore
     except Exception:
         annotate_pdf_essay_pages = None  # type: ignore
+
+# Spelling/OCR detection: hyphenated filename requires spec_from_file_location (no normal import).
+run_spelling_detection = None  # type: Optional[Any]
+try:
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _ocr_spell_path = os.path.join(_this_dir, "ocr-spell-correction.py")
+    if os.path.exists(_ocr_spell_path):
+        _spec = importlib.util.spec_from_file_location("ocr_spell_correction", _ocr_spell_path)
+        if _spec and _spec.loader:
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            run_spelling_detection = getattr(_mod, "run_spelling_detection", None)
+except Exception:
+    run_spelling_detection = None
+
+
+# Annotated-page rendering defaults. Tuned to keep output PDFs compact while
+# preserving layout and annotation structure. These can be overridden via CLI.
+ANNOTATED_PAGE_DPI_DEFAULT = 160
+ANNOTATED_PAGE_JPEG_QUALITY_DEFAULT = 75
+ANNOTATED_PAGE_MAX_SIZE_MB = 10.0
+ANNOTATED_PAGE_TARGET_SIZE_MB = 9.0
 
 
 DEFAULT_PRECIS_CRITERIA: List[Dict[str, Any]] = [
@@ -468,6 +492,9 @@ def run_ocr_on_pdf(
             "ocr_page_text": " ".join(page_text_parts).strip(),
             "lines": lines_out,
             "words": words_out,
+            "page_width_px": pil_img.width,
+            "page_height_px": pil_img.height,
+            "unit": "pixel",
         }
 
     pages: List[Dict[str, Any]] = []
@@ -644,6 +671,51 @@ def pil_images_to_pdf_bytes(pages: List[Image.Image]) -> bytes:
     return out.getvalue()
 
 
+def normalize_spelling_errors(
+    raw_errors: List[Dict[str, Any]],
+    num_pages: int,
+) -> List[Dict[str, Any]]:
+    """
+    Normalize spelling/grammar errors to a canonical shape; drop invalid entries; deduplicate.
+    Returns list of dicts with: page (int, 1-based), error_text, correction, anchor_quote (optional), category.
+    """
+    if num_pages <= 0:
+        return []
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for err in raw_errors or []:
+        page = err.get("page") or err.get("page_number")
+        if page is None:
+            continue
+        try:
+            p = int(page)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= p <= num_pages):
+            continue
+        error_text = (err.get("error_text") or "").strip()
+        correction = (err.get("correction") or "").strip()
+        if not error_text or not correction:
+            continue
+        anchor_quote = err.get("anchor_quote")
+        if anchor_quote is not None:
+            anchor_quote = str(anchor_quote).strip() or None
+        etype = (err.get("type") or "").strip().lower()
+        category = "spelling" if etype == "spelling" else "grammar_presentation"
+        key = (p, error_text, correction)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "page": p,
+            "error_text": error_text,
+            "correction": correction,
+            "anchor_quote": anchor_quote,
+            "category": category,
+        })
+    return out
+
+
 def merge_report_and_annotated_answer(
     report_pdf_path: str,
     annotated_pages: List[Image.Image],
@@ -664,7 +736,12 @@ def merge_report_and_annotated_answer(
     for img in annotated_pages:
         page = out_doc.new_page(width=target_w, height=target_h)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="PNG")
+        img.convert("RGB").save(
+            buf,
+            format="JPEG",
+            quality=ANNOTATED_PAGE_JPEG_QUALITY_DEFAULT,
+            optimize=True,
+        )
         stream = buf.getvalue()
         # Preserve aspect ratio; top-align to avoid empty space above annotations.
         img_w, img_h = img.size
@@ -1157,6 +1234,22 @@ def _extract_answer_block_text(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
     return title.strip(), answer_block_text.strip()
 
 
+def _clean_question_text(text: str) -> str:
+    """Strip known watermark / noise patterns from question-related text tails."""
+    s = str(text or "").strip()
+    if not s:
+        return ""
+
+    # Remove common CamScanner-style watermarks at the end of the string.
+    watermark_patterns = [
+        r"\s*[.;,:-]*\s*(cs\s+camscanner.*)$",  # "CS CamScanner" with possible junk before
+        r"\s*[.;,:-]*\s*camscanner.*$",        # any trailing "CamScanner" variant
+    ]
+    for pat in watermark_patterns:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE).strip()
+    return s
+
+
 def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
     pages = ocr_data.get("pages") or []
     page1 = None
@@ -1225,12 +1318,18 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
     if not page1_text:
         return "", ""
 
-    instruction_anchor_patterns = [
-        r"\bexercise\b",
-        r"write\s+a\s+pr[eé]cis",
-        r"\bpr[eé]cis\b",
-        r"suggest\s+a\s+suitable\s+title",
+    # Prioritized patterns ordered by specificity (most specific first)
+    # Format: (pattern, priority_score) where higher score = higher priority
+    prioritized_patterns = [
+        (r"exercise\s+\d+\s*:\s*write\s+a\s+pr[eé]cis", 10),  # "Exercise 1: Write a precis"
+        (r"exercise\s+\d+\s*:", 9),  # "Exercise 1:" or "Exercise 2:"
+        (r"write\s+a\s+pr[eé]cis\s+of\s+the\s+following\s+passage", 8),  # Full instruction
+        (r"write\s+a\s+pr[eé]cis", 7),  # "Write a precis"
+        (r"suggest\s+a\s+suitable\s+title", 6),  # "suggest a suitable title"
+        (r"\bexercise\b", 3),  # Generic "exercise" (low priority)
+        (r"\bpr[eé]cis\b", 2),  # Generic "precis" (lowest priority, fallback)
     ]
+
     passage_start_idx: Optional[int] = None
     m_drop = re.search(r"\ba\s+drop\s+of\s+water\b", page1_text, flags=re.IGNORECASE)
     if m_drop:
@@ -1241,16 +1340,83 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
             passage_start_idx = m_alas.start()
 
     if passage_start_idx is not None:
-        instr_positions: List[int] = []
-        for pat in instruction_anchor_patterns:
-            for m in re.finditer(pat, page1_text, flags=re.IGNORECASE):
-                if m.start() < passage_start_idx:
-                    instr_positions.append(m.start())
-        q_start = min(instr_positions) if instr_positions else 0
+        # Find matches with priority scoring
+        # Format: (position, priority_score)
+        candidate_matches: List[Tuple[int, int]] = []
+        for pattern, priority in prioritized_patterns:
+            for m in re.finditer(pattern, page1_text, flags=re.IGNORECASE):
+                match_pos = m.start()
+                if match_pos < passage_start_idx:
+                    candidate_matches.append((match_pos, priority))
+        
+        # Select best match: highest priority first, then closest to passage start
+        if candidate_matches:
+            # Sort by priority (descending), then by position (ascending - closer to passage is better)
+            candidate_matches.sort(key=lambda x: (-x[1], x[0]))
+            q_start = candidate_matches[0][0]
+        else:
+            q_start = 0
+        
+        # Extract question text and validate
         question_text = _norm_ws(page1_text[q_start:passage_start_idx]).strip(" :-")
         statement_text = _norm_ws(page1_text[passage_start_idx:])
+
+        # Validation: filter out false positives from explanatory text
+        if question_text:
+            question_lower = question_text.lower()
+            # Check for common explanatory phrases that shouldn't start a question
+            explanatory_phrases = [
+                "following are",
+                "examples",
+                "steps",
+                "by following",
+                "systematically transform",
+                "precis while",  # Catch cases like "precis while message"
+                "while message",  # Catch continuation of explanatory text
+            ]
+            # Check if question starts with or contains explanatory text before actual instruction
+            starts_with_explanatory = any(question_lower.startswith(phrase) for phrase in explanatory_phrases)
+            # Also check if question contains "Exercise" or "Write a precis" patterns (actual instructions)
+            has_actual_instruction = bool(
+                re.search(r"exercise\s+\d+\s*:", question_text, flags=re.IGNORECASE)
+                or re.search(r"write\s+a\s+pr[eé]cis", question_text, flags=re.IGNORECASE)
+            )
+
+            # If question starts with explanatory text but contains actual instruction, extract from instruction
+            if starts_with_explanatory and has_actual_instruction:
+                # Look for "Exercise" or "Write a precis" patterns in the extracted text
+                exercise_match = re.search(r"exercise\s+\d+\s*:", question_text, flags=re.IGNORECASE)
+                write_match = re.search(r"write\s+a\s+pr[eé]cis", question_text, flags=re.IGNORECASE)
+                if exercise_match:
+                    # Extract from Exercise pattern onwards
+                    question_text = question_text[exercise_match.start():].strip()
+                elif write_match:
+                    # Extract from "Write a precis" pattern onwards
+                    question_text = question_text[write_match.start():].strip()
+            elif starts_with_explanatory:
+                # Question starts with explanatory text but no clear instruction found
+                # Try to find a better start position using prioritized patterns
+                for pattern, priority in prioritized_patterns[:5]:  # Use top 5 patterns
+                    matches = list(re.finditer(pattern, page1_text[:passage_start_idx], flags=re.IGNORECASE))
+                    if matches:
+                        # Use the last (closest to passage) match
+                        best_match = matches[-1]
+                        question_text = _norm_ws(page1_text[best_match.start():passage_start_idx]).strip(" :-")
+                        break
+
         if not question_text:
             question_text = _norm_ws(page1_text[:passage_start_idx]).strip(" :-")
+
+        # If this looks like an Exercise-style question, trim trailing noise after "title."
+        if question_text and question_text.lstrip().lower().startswith("exercise"):
+            m_title = re.search(r"^(.*?title\.)", question_text, flags=re.IGNORECASE)
+            if m_title:
+                question_text = m_title.group(1).strip()
+
+        # Final cleanup: strip known watermark/noise tails.
+        question_text = _clean_question_text(question_text)
+        statement_text = _clean_question_text(statement_text)
+
         return question_text, statement_text
 
     # Fallback when anchors are missing.
@@ -1271,7 +1437,10 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
             statement_lines.append(text)
         else:
             question_lines.append(text)
-    return _norm_ws(" ".join(question_lines)), _norm_ws(" ".join(statement_lines))
+
+    q_fallback = _clean_question_text(_norm_ws(" ".join(question_lines)))
+    s_fallback = _clean_question_text(_norm_ws(" ".join(statement_lines)))
+    return q_fallback, s_fallback
 
 
 def call_grok_for_precis_grading(
@@ -1339,8 +1508,11 @@ def call_grok_for_precis_grading(
     system = {
         "role": "system",
         "content": (
-            "You are a strict CSS precis examiner. "
-            "Return valid JSON only with no markdown or commentary."
+            "You are a strict CSS precis examiner.\n"
+            "- You MUST return a single JSON object only (no markdown, no prose, no code fences).\n"
+            "- The JSON object MUST have exactly the same top-level shape as the provided output_schema in the DATA payload "
+            "(no extra wrapper objects like `grading`, no extra fields).\n"
+            "- Do not include any explanations, comments, or text outside the JSON object."
         ),
     }
 
@@ -1364,6 +1536,12 @@ def call_grok_for_precis_grading(
         "- ideal_precis.text must be a high-quality improved precis for this same passage.\n"
         "- ideal_precis.title must be concise and relevant.\n"
         "- ideal_precis.title and ideal_precis.text must both be non-empty.\n"
+        "Output format rules (CRITICAL):\n"
+        "- Return ONE JSON object whose top-level keys match output_schema exactly.\n"
+        "- Do NOT nest the result under another key such as `grading`.\n"
+        "- Expected top-level keys include: question_text, question_statement_text, topic, student_title, "
+        "student_precis_text, original_passage_word_count, required_precis_word_count, student_precis_word_count, "
+        "length_status, criteria, total_awarded, overall_rating, reasons_for_low_score, ideal_precis, overall_remarks.\n"
         "Question extraction rules:\n"
         "- question_text must come from question_block_text only.\n"
         "- question_statement_text must come from question_statement_block_text only.\n"
@@ -1504,7 +1682,8 @@ def call_grok_for_precis_grading(
         return True
 
     last_err: Optional[Exception] = None
-    for attempt in range(4):
+    # Limit retries so we do not waste time on repeatedly invalid JSON.
+    for attempt in range(2):
         print(f"  Precis grading attempt {attempt + 1}/4...")
         response = _grok_chat(
             grok_api_key,
@@ -1825,7 +2004,11 @@ def _dominant_colors_from_scheme(image_path: str) -> Dict[str, Tuple[float, floa
     try:
         img = Image.open(image_path).convert("RGB")
         img.thumbnail((320, 320))
-        px = list(img.getdata())
+        # Use Pillow's flattened data API when available to avoid deprecation warnings.
+        if hasattr(img, "get_flattened_data"):
+            px = list(img.get_flattened_data())  # type: ignore[attr-defined]
+        else:
+            px = list(img.getdata())
 
         def _is_whiteish(rgb: Tuple[int, int, int]) -> bool:
             return rgb[0] > 240 and rgb[1] > 240 and rgb[2] > 240
@@ -2179,6 +2362,9 @@ def run_precis_grading(
     annotations_temperature: float = float(DEFAULT_MODELS["annotations"]["temperature"]),
     repair_model: str = DEFAULT_MODELS["json_repair"]["model"],
     repair_temperature: float = float(DEFAULT_MODELS["json_repair"]["temperature"]),
+    annotated_page_dpi: int = ANNOTATED_PAGE_DPI_DEFAULT,
+    annotated_page_jpeg_quality: int = ANNOTATED_PAGE_JPEG_QUALITY_DEFAULT,
+    enable_spelling_annotations: bool = True,
 ) -> Dict[str, Any]:
     validate_input_paths(pdf_path, output_json_path, output_pdf_path)
     grok_key, doc_client = load_environment(env_file)
@@ -2203,6 +2389,36 @@ def run_precis_grading(
     timings["Extra text filtering"] = time.perf_counter() - t0
     print(f"Extra text filtering done in {_format_duration(timings['Extra text filtering'])} "
           f"(removed {extra_text_pack.get('removed_line_count', 0)} lines)")
+
+    # Spelling/grammar detection (optional); normalize and save debug
+    raw_spelling_errors: List[Dict[str, Any]] = []
+    if enable_spelling_annotations and run_spelling_detection is not None:
+        try:
+            payload = run_spelling_detection(grok_key, ocr_data)
+            raw_spelling_errors = payload.get("errors", []) or []
+        except Exception as e:
+            print(f"Warning: spelling detection failed: {e}")
+            raw_spelling_errors = []
+    else:
+        if not enable_spelling_annotations:
+            print("Spelling annotations skipped (disabled).")
+        else:
+            print("Spelling annotations skipped (module not available).")
+    num_ocr_pages = len(ocr_data.get("pages", []))
+    normalized_spelling_errors = normalize_spelling_errors(raw_spelling_errors, num_ocr_pages)
+    pages_affected = sorted({e["page"] for e in normalized_spelling_errors})
+    print(f"Spelling: raw_errors={len(raw_spelling_errors)}, normalized={len(normalized_spelling_errors)}, pages_affected={pages_affected}")
+    debug_llm_dir = os.path.join(os.path.dirname(output_json_path) or ".", "debug_llm")
+    os.makedirs(debug_llm_dir, exist_ok=True)
+    spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
+    with open(spelling_debug_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "raw_count": len(raw_spelling_errors),
+            "normalized_count": len(normalized_spelling_errors),
+            "errors": normalized_spelling_errors,
+            "meta": {"total_pages": num_ocr_pages, "pages_affected": pages_affected},
+        }, f, indent=2, ensure_ascii=False)
+    print(f"Spelling debug saved -> {spelling_debug_path}")
 
     print("Preparing page images for Grok...")
     t0 = time.perf_counter()
@@ -2336,7 +2552,7 @@ def run_precis_grading(
     print("Rendering annotated precis pages...")
     t0 = time.perf_counter()
     if annotate_pdf_essay_pages is None:
-        raise RuntimeError("annotate_pdf_with_essay_rubric.py is required for annotation rendering.")
+        raise RuntimeError("annotate_pdf_with_precis.py is required for annotation rendering.")
 
     annotated_pages = annotate_pdf_essay_pages(
         pdf_path=pdf_path,
@@ -2345,13 +2561,59 @@ def run_precis_grading(
         grading=grading,
         annotations=annotations,
         page_suggestions=page_suggestions,
-        spelling_errors=None,
+        spelling_errors=normalized_spelling_errors,
         max_callouts_per_page=8,
+        dpi=annotated_page_dpi,
     )
     if has_question_page and len(annotated_pages) >= 2:
         # Drop the annotated question page to avoid duplicating the report's question page.
         annotated_pages = annotated_pages[1:]
+    # Build per-page transforms for spelling overlay on merged PDF (same scale/offset as merge).
+    target_w, target_h = 595.0, 842.0
+    if report_tmp and os.path.exists(report_tmp):
+        _rdoc = fitz.open(report_tmp)
+        if len(_rdoc) > 0:
+            _r0 = _rdoc[0].rect
+            target_w, target_h = float(_r0.width), float(_r0.height)
+        _rdoc.close()
+    page_transforms: List[Tuple[float, float, float]] = []
+    for _img in annotated_pages:
+        _iw, _ih = _img.size
+        if _iw <= 0 or _ih <= 0:
+            page_transforms.append((1.0, 0.0, 0.0))
+            continue
+        _scale_pp = min(target_w / _iw, target_h / _ih)
+        _draw_w = _iw * _scale_pp
+        _x0 = (target_w - _draw_w) / 2.0
+        _y0 = 0.0
+        _scale_pt = _scale_pp * annotated_page_dpi / 72.0
+        page_transforms.append((_scale_pt, _x0, _y0))
+    num_report_pages = 0
+    if report_tmp and os.path.exists(report_tmp):
+        _rdoc = fitz.open(report_tmp)
+        num_report_pages = len(_rdoc)
+        _rdoc.close()
+    first_answer_page_1based = 2 if has_question_page else 1
     merge_report_and_annotated_answer(report_tmp, annotated_pages, output_pdf_path)
+    if normalized_spelling_errors and enable_spelling_annotations and add_spelling_annotations_to_merged_pdf is not None and page_transforms:
+        placement_results = add_spelling_annotations_to_merged_pdf(
+            output_pdf_path,
+            ocr_data,
+            normalized_spelling_errors,
+            num_report_pages,
+            first_answer_page_1based,
+            page_transforms,
+        )
+        spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
+        if placement_results and os.path.exists(spelling_debug_path):
+            try:
+                with open(spelling_debug_path, "r", encoding="utf-8") as f:
+                    debug_data = json.load(f)
+                debug_data["placement"] = placement_results
+                with open(spelling_debug_path, "w", encoding="utf-8") as f:
+                    json.dump(debug_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
     if report_only_pdf_path is None:
         try:
             os.unlink(report_tmp)
@@ -2400,7 +2662,23 @@ def main() -> None:
     parser.add_argument("--annotations-temperature", type=float, default=float(DEFAULT_MODELS["annotations"]["temperature"]))
     parser.add_argument("--repair-model", default=DEFAULT_MODELS["json_repair"]["model"])
     parser.add_argument("--repair-temperature", type=float, default=float(DEFAULT_MODELS["json_repair"]["temperature"]))
+    parser.add_argument(
+        "--annotated-dpi",
+        type=int,
+        default=ANNOTATED_PAGE_DPI_DEFAULT,
+        help="DPI used when rasterizing pages for annotated precis images",
+    )
+    parser.add_argument(
+        "--annotated-jpeg-quality",
+        type=int,
+        default=ANNOTATED_PAGE_JPEG_QUALITY_DEFAULT,
+        help="JPEG quality (1-95) for annotated precis pages embedded into output PDF",
+    )
+    parser.add_argument("--no-spelling", action="store_true", help="Disable spelling/grammar annotations on output PDF")
+    parser.add_argument("--enable-spelling", action="store_true", help="Enable spelling/grammar annotations (default)")
     args = parser.parse_args()
+
+    enable_spelling = args.enable_spelling or not args.no_spelling
 
     result = run_precis_grading(
         pdf_path=args.pdf,
@@ -2419,6 +2697,9 @@ def main() -> None:
         annotations_temperature=args.annotations_temperature,
         repair_model=args.repair_model,
         repair_temperature=args.repair_temperature,
+        annotated_page_dpi=args.annotated_dpi,
+        annotated_page_jpeg_quality=args.annotated_jpeg_quality,
+        enable_spelling_annotations=enable_spelling,
     )
     print(f"\nDone. Report PDF: {result['pdf_path']}")
 

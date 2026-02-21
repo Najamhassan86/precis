@@ -1,1 +1,43 @@
-{"page":3,"page_suggestions":["Correct possessive 'it's' to 'its' for accuracy.","Remove extraneous space before comma in 'production ,' for polish.","Add period after 'progress' before word count note."],"annotations":[{"page":3,"type":"grammar_presentation","rubric_point":"Grammar/spelling/punctuation errors.","anchor_quote":"it's","correction":"its","comment":"Change contraction to possessive pronoun."},{"page":3,"type":"language_clarity","rubric_point":"Clarity, Coherence & Logical Flow","anchor_quote":"production ,","correction":"production,","comment":"Eliminate space before comma to smooth phrasing."},{"page":3,"type":"grammar_presentation","rubric_point":"Grammar, & Presentation","anchor_quote":"progress Total","correction":"progress. Total","comment":"Insert period to end sentence properly."}]}
+{
+  "page": 3,
+  "page_suggestions": [
+    "Add a concise, specific title (4-8 words) capturing profit focus vs. human well-being.",
+    "Correct grammar, punctuation, and tighten wordy phrases for clarity and conciseness.",
+    "Expand to fully cover all major ideas while staying near 124-word target.",
+    "Improve logical flow with smoother transitions mirroring original sequence."
+  ],
+  "annotations": [
+    {
+      "page": 3,
+      "type": "grammar_presentation",
+      "rubric_point": "Grammar/spelling/punctuation errors.",
+      "anchor_quote": "it's true purpose",
+      "correction": "its true purpose",
+      "comment": "Use 'its' (possessive) not 'it's' (contraction)."
+    },
+    {
+      "page": 3,
+      "type": "grammar_presentation",
+      "rubric_point": "Grammar/spelling/punctuation errors.",
+      "anchor_quote": "production ,",
+      "correction": "production,",
+      "comment": "Remove extraneous space before comma."
+    },
+    {
+      "page": 3,
+      "type": "brevity_conciseness",
+      "rubric_point": "Compression & Conciseness",
+      "anchor_quote": "making it difficult to think clearly about human well-being",
+      "correction": "obscuring human well-being",
+      "comment": "Compress wordy clause; eliminate unnecessary words."
+    },
+    {
+      "page": 3,
+      "type": "brevity_conciseness",
+      "rubric_point": "Length & Word Count Adherence",
+      "anchor_quote": "Precis word count: 127 words",
+      "correction": "Target 110-140 words; expand core ideas omitted.",
+      "comment": "Slightly over target but feels short due to missing points."
+    }
+  ]
+}

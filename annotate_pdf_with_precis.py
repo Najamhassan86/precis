@@ -1,4 +1,4 @@
-# annotate_pdf_with_essay_rubric_fixed.py
+# annotate_pdf_with_precis.py
 """
 ROBUST PDF ANNOTATION (digital + scanned) with **OCR-ANCHOR FIX**
 
@@ -32,6 +32,23 @@ import numpy as np
 from PIL import Image
 import cv2
 
+
+# Right-side annotation layout: set True to print box geometry and overflow flags
+DEBUG_RIGHT_BOX_LAYOUT = False
+RIGHT_BOX_MIN_GAP = 8  # minimum vertical gap between right-side boxes (px)
+
+# Spelling annotation placement: set True to print box/connector geometry per error
+DEBUG_SPELL_DRAW = True
+# Spelling match: set True to print match method and result per error
+DEBUG_SPELL_MATCH = False
+# Spelling box: gap above/below word, padding, min box width, font size range
+SPELL_BOX_GAP_PT = 8.0
+SPELL_BOX_PADDING_PT = 6.0
+SPELL_BOX_MIN_WIDTH_PT = 40.0
+SPELL_BOX_FONT_START = 10
+SPELL_BOX_FONT_MIN = 8
+SPELL_CONNECTOR_WIDTH = 1.0
+SPELL_COLOR = (0.8, 0, 0)
 
 # ============================================================
 # TEXT HELPERS
@@ -675,6 +692,45 @@ def _wrap_text_lines(text: str, font_scale: float, thickness: int, max_width_px:
         lines.append(cur)
     return lines
 
+
+def _wrap_text_lines_with_word_break(text: str, font_scale: float, thickness: int, max_width_px: int) -> List[str]:
+    """Like _wrap_text_lines but breaks long words that exceed max_width_px so they never overflow."""
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    words = (_sanitize_text_for_render(text) or "").split()
+    if not words:
+        return []
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        (w_w, _), _ = cv2.getTextSize(w, font_face, font_scale, thickness)
+        if w_w <= max_width_px:
+            test = (cur + " " + w).strip()
+            (tw, _), _ = cv2.getTextSize(test, font_face, font_scale, thickness)
+            if tw <= max_width_px or not cur:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        else:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            while w:
+                for k in range(len(w), 0, -1):
+                    chunk = w[:k]
+                    (cw, _), _ = cv2.getTextSize(chunk, font_face, font_scale, thickness)
+                    if cw <= max_width_px:
+                        lines.append(chunk)
+                        w = w[k:]
+                        break
+                else:
+                    lines.append(w[0])
+                    w = w[1:]
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def _estimate_text_height(text: str, font_scale: float, thickness: int, max_width_px: int, line_gap: int = 8) -> int:
     lines = _wrap_text_lines(text, font_scale, thickness, max_width_px)
     if not lines:
@@ -730,6 +786,57 @@ def _draw_red_tick(
     cv2.line(img, p2, p3, color, t, cv2.LINE_AA)
 
 
+# --- LEFT MARGIN BOX LAYOUT (vertical only, fit to page) ---
+LEFT_BOX_MIN_GAP = 12  # vertical gap between left-side improvement boxes
+LEFT_BOX_TOP_PAD = 20
+LEFT_BOX_BOTTOM_PAD = 20
+
+
+def _fit_left_annotation_box(
+    text: str,
+    max_width_px: int,
+    max_height_px: int,
+    start_scale: float = 1.55,
+    thickness: int = 2,
+    line_gap: int = 18,
+    top_pad: int = 20,
+    bottom_pad: int = 20,
+    min_scale: float = 0.55,
+    font_step: float = 0.06,
+) -> Tuple[float, List[str], int, bool]:
+    """
+    Fit single-block text (e.g. improvement bullet) into a left-side box: wrap by width,
+    step down font until it fits, then truncate with "..." if still too tall at min_scale.
+    Returns (font_scale, lines, box_h, overflow_truncated).
+    """
+    overflow_truncated = False
+    font_s = start_scale
+    max_content_h = max(1, max_height_px - top_pad - bottom_pad)
+
+    while font_s >= min_scale:
+        lines = _wrap_text_lines_with_word_break(text, font_s, thickness, max_width_px)
+        box_h = _box_height_for_wrapped_lines(len(lines), font_s, thickness, line_gap, top_pad, bottom_pad)
+        if box_h <= max_height_px:
+            return (font_s, lines, box_h, False)
+        font_s -= font_step
+
+    font_s = max(min_scale, font_s)
+    lines = _wrap_text_lines_with_word_break(text, font_s, thickness, max_width_px)
+    (_, th), _ = cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
+    line_height = th + line_gap
+    max_lines = max(0, (max_content_h + line_gap) // line_height) if line_height > 0 else 0
+    if len(lines) > max_lines:
+        overflow_truncated = True
+        if max_lines <= 0:
+            lines = ["..."]
+        else:
+            lines = lines[:max_lines]
+            last = (lines[-1] or "").strip()
+            lines[-1] = (last[:-3] + "...") if len(last) > 3 else "..."
+    box_h = _box_height_for_wrapped_lines(len(lines), font_s, thickness, line_gap, top_pad, bottom_pad)
+    return (font_s, lines, box_h, overflow_truncated)
+
+
 # --- DYNAMIC LEFT BOX HELPERS ---
 def _box_height_for_wrapped_lines(num_lines: int, font_scale: float, thickness: int, line_gap: int, top_pad: int, bottom_pad: int) -> int:
     if num_lines <= 0:
@@ -760,13 +867,112 @@ def _fit_text_box(
     return min_scale, lines, box_h
 
 
+# --- RIGHT-SIDE ANNOTATION BOX HELPERS ---
+# Fixed padding for right-side boxes: top 28, header-body gap 36, bottom 8 (total 72)
+_RIGHT_BOX_TOP_PAD = 28
+_RIGHT_BOX_HEADER_BODY_GAP = 36
+_RIGHT_BOX_BOTTOM_PAD = 8
+_RIGHT_BOX_FIXED_PAD = _RIGHT_BOX_TOP_PAD + _RIGHT_BOX_HEADER_BODY_GAP + _RIGHT_BOX_BOTTOM_PAD  # 72
+
+
+def _fit_right_annotation_box(
+    header: str,
+    body: str,
+    box_w: int,
+    max_box_h: int,
+    font_start_header: float = 1.35,
+    font_start_body: float = 1.25,
+    thickness: int = 2,
+    line_gap: int = 20,
+    font_min: float = 0.45,
+    font_step: float = 0.05,
+) -> Tuple[float, float, List[str], List[str], int, bool]:
+    """
+    Fit header + body text inside a right-side annotation box: wrap to width, step down
+    font until content fits, then optionally truncate body with ellipsis at font_min.
+    Returns (header_scale, body_scale, header_lines, body_lines, box_h, overflow_truncated).
+    Uses _wrap_text_lines_with_word_break so long headers/labels stay inside the box.
+    """
+    text_w = max(1, box_w - 28)  # 14px horizontal padding each side to avoid right-edge overflow
+    overflow_truncated = False
+    header_scale = font_start_header
+    body_scale = font_start_body
+
+    def _content_height(h_scale: float, b_scale: float, h_lines: List[str], b_lines: List[str]) -> int:
+        h_h = _box_height_for_wrapped_lines(len(h_lines), h_scale, thickness, line_gap, 0, 0)
+        b_h = _box_height_for_wrapped_lines(len(b_lines), b_scale, thickness, line_gap, 0, 0)
+        return _RIGHT_BOX_FIXED_PAD + h_h + b_h
+
+    # Step down font until content fits or we hit font_min; use word-break wrap for long labels
+    while header_scale >= font_min and body_scale >= font_min:
+        header_lines = _wrap_text_lines_with_word_break(header, header_scale, thickness, text_w)
+        body_lines = _wrap_text_lines_with_word_break(body, body_scale, thickness, text_w)
+        box_h = _content_height(header_scale, body_scale, header_lines, body_lines)
+        if box_h <= max_box_h:
+            return (header_scale, body_scale, header_lines, body_lines, box_h, False)
+        header_scale -= font_step
+        body_scale -= font_step
+
+    header_scale = max(font_min, header_scale)
+    body_scale = max(font_min, body_scale)
+    header_lines = _wrap_text_lines_with_word_break(header, header_scale, thickness, text_w)
+    body_lines = _wrap_text_lines_with_word_break(body, body_scale, thickness, text_w)
+    h_h = _box_height_for_wrapped_lines(len(header_lines), header_scale, thickness, line_gap, 0, 0)
+    body_max_h = max(0, max_box_h - _RIGHT_BOX_FIXED_PAD - h_h)
+    (_, th), _ = cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, body_scale, thickness)
+    line_height = th + line_gap
+    max_body_lines = max(0, (body_max_h + line_gap) // line_height) if line_height > 0 else 0
+
+    if len(body_lines) > max_body_lines:
+        overflow_truncated = True
+        if max_body_lines <= 0:
+            body_lines = ["..."]
+        else:
+            body_lines = body_lines[:max_body_lines]
+            last = (body_lines[-1] or "").strip()
+            if len(last) > 3:
+                body_lines[-1] = last[:-3] + "..."
+            else:
+                body_lines[-1] = "..."
+    b_h = _box_height_for_wrapped_lines(len(body_lines), body_scale, thickness, line_gap, 0, 0)
+    box_h = _RIGHT_BOX_FIXED_PAD + h_h + b_h
+    return (header_scale, body_scale, header_lines, body_lines, box_h, overflow_truncated)
+
+
+def _draw_lines_at(
+    img: np.ndarray,
+    x: int,
+    y: int,
+    lines: List[str],
+    font_scale: float,
+    thickness: int,
+    color,
+    line_gap: int = 8,
+) -> int:
+    """Draw pre-wrapped lines at (x, y). y is top of first line. Returns total height used.
+    Returned height matches _box_height_for_wrapped_lines (no line_gap after last line).
+    """
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+    used = 0
+    for i, ln in enumerate(lines):
+        (_, th), _ = cv2.getTextSize(ln, font_face, font_scale, thickness)
+        cv2.putText(img, ln, (x, y + used + th), font_face, font_scale, color, thickness, cv2.LINE_AA)
+        used += th + (line_gap if i < len(lines) - 1 else 0)
+    return used
+
+
 # ============================================================
 # PYMUPDF SPELLING ANNOTATION HELPERS
 # ============================================================
 
 def _norm_token_for_spelling(t: str) -> str:
-    """Normalize a token for spelling error matching."""
-    return re.sub(r"[^a-z0-9]", "", t.lower())
+    """Normalize a token for spelling error matching: lowercase, strip punctuation, collapse to alphanumeric."""
+    return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+
+
+def _norm_phrase_tokens_for_spelling(phrase: str) -> List[str]:
+    """Normalize phrase for spelling: split on whitespace, normalize each token, drop empty. Used for multi-word matching."""
+    return [_norm_token_for_spelling(w) for w in (phrase or "").split() if _norm_token_for_spelling(w)]
 
 def _bbox_to_rect_float(bbox: List) -> Optional[Tuple[float, float, float, float]]:
     """Convert polygon bbox to (x0,y0,x1,y1) with float precision."""
@@ -785,7 +991,7 @@ def _unit_scale_to_points(unit: str) -> float:
     return 1.0
 
 def _word_rects_in_page_coords_fitz(page_info: Dict[str, Any]) -> List[Tuple[fitz.Rect, float, str]]:
-    """Return list of (rect_in_points, confidence, text) for all words in page."""
+    """Return list of (rect_in_points, confidence, text) for all words in page, sorted by reading order (y0, x0)."""
     scale = _unit_scale_to_points(page_info.get("unit", "pixel"))
     out = []
     for w in page_info.get("words", []) or []:
@@ -796,38 +1002,222 @@ def _word_rects_in_page_coords_fitz(page_info: Dict[str, Any]) -> List[Tuple[fit
         x0, y0, x1, y1 = r
         rect_pts = fitz.Rect(x0 * scale, y0 * scale, x1 * scale, y1 * scale)
         out.append((rect_pts, float(w.get("confidence", 1.0) or 1.0), w.get("text", "")))
+    out.sort(key=lambda item: (item[0].y0, item[0].x0))
     return out
+
+# Token window expansion around anchor hit (tokens before/after) for phrase search
+_SPELL_ANCHOR_WINDOW = 20
+
 
 def _find_error_word_span_fitz(
     wordrects: List[Tuple[fitz.Rect, float, str]],
     error_text: str,
     anchor_quote: Optional[str] = None
-) -> Optional[fitz.Rect]:
-    """Find the bounding box for error_text by matching normalized word sequences."""
+) -> Tuple[Optional[fitz.Rect], str]:
+    """Find the bounding box for error_text by matching normalized word sequences.
+    Wordrects must be sorted by reading order (y0, x0). Uses page-level words only.
+    If anchor_quote is provided, try a window around it first, then always fall back to full page.
+    Returns (rect or None, match_method).
+    """
     target = _norm_token_for_spelling(error_text)
-    if not target:
-        return None
+    error_tokens = _norm_phrase_tokens_for_spelling(error_text)
+    if not target and not error_tokens:
+        return None, "not_found"
 
-    tokens = [(_norm_token_for_spelling(w), r, c) for (r, c, w) in wordrects]
-    
-    # Single word match
-    for t, r, _ in tokens:
-        if t == target:
-            return r
+    tokens = [(_norm_token_for_spelling(w), r, w) for (r, _c, w) in wordrects]
 
-    # Multi-word span (join consecutive)
-    for i in range(len(tokens)):
-        acc = ""
-        r_union = None
-        for j in range(i, min(i + 6, len(tokens))):
-            acc += tokens[j][0]
-            r_union = tokens[j][1] if r_union is None else (r_union | tokens[j][1])
-            if acc == target:
-                return r_union
-            if len(acc) > len(target):
+    def search_in_range(start: int, end: int) -> Tuple[Optional[fitz.Rect], str]:
+        r_end = min(end, len(tokens))
+        # 1) Single-word exact
+        for i in range(start, r_end):
+            t, r, _ = tokens[i]
+            if t == target:
+                return r, "full_page_exact"
+        # 2) Multi-word: consecutive token sequence (e.g. "false" then "belief")
+        if len(error_tokens) >= 2:
+            for i in range(start, r_end - len(error_tokens) + 1):
+                if all(tokens[i + k][0] == error_tokens[k] for k in range(len(error_tokens))):
+                    r_union = tokens[i][1]
+                    for k in range(1, len(error_tokens)):
+                        r_union = r_union | tokens[i + k][1]
+                    return r_union, "full_page_exact"
+        # 3) Multi-word: concatenated (legacy)
+        for i in range(start, r_end):
+            acc = ""
+            r_union = None
+            for j in range(i, min(i + 8, r_end)):
+                acc += tokens[j][0]
+                r_union = tokens[j][1] if r_union is None else (r_union | tokens[j][1])
+                if acc == target:
+                    return r_union, "full_page_exact"
+                if len(acc) > len(target):
+                    break
+        return None, "not_found"
+
+    if anchor_quote:
+        anchor_norm = _norm_token_for_spelling(anchor_quote)
+        anchor_phrase = _norm_phrase_tokens_for_spelling(anchor_quote)
+        if anchor_norm or anchor_phrase:
+            for i in range(len(tokens)):
+                # Match anchor as phrase or as substring of concatenated
+                acc = ""
+                for j in range(i, min(i + 20, len(tokens))):
+                    acc += tokens[j][0]
+                    anchor_ok = (
+                        (anchor_norm and (anchor_norm in acc or acc in anchor_norm))
+                        or (anchor_phrase and j - i + 1 >= len(anchor_phrase)
+                            and all(tokens[i + k][0] == anchor_phrase[k] for k in range(len(anchor_phrase))))
+                    )
+                    if anchor_ok:
+                        window_start = max(0, i - _SPELL_ANCHOR_WINDOW)
+                        window_end = min(len(tokens), j + 1 + _SPELL_ANCHOR_WINDOW)
+                        found_rect, method = search_in_range(window_start, window_end)
+                        if found_rect is not None:
+                            return found_rect, "anchor_window"
+                        break
+                    if len(acc) > (len(anchor_norm or "") + 20):
+                        break
+
+    # Full-page fallback (always run if anchor didn't return)
+    found_rect, method = search_in_range(0, len(tokens))
+    if found_rect is not None:
+        return found_rect, method
+    return None, "not_found"
+
+
+def _compute_spelling_box_geometry(
+    word_rect: "fitz.Rect",
+    correction_text: str,
+    page_rect: "fitz.Rect",
+    existing_boxes: Optional[List["fitz.Rect"]] = None,
+) -> Tuple["fitz.Rect", float, str]:
+    """
+    Compute spelling annotation box above (or below) the word rect, with font size fitted to box width.
+    If existing_boxes is provided, shift this box to avoid overlapping them (same-page collision avoidance).
+    Returns (box_rect, font_size, placement) where placement is "above" or "below".
+    """
+    existing_boxes = existing_boxes or []
+    if not correction_text:
+        return fitz.Rect(0, 0, 0, 0), float(SPELL_BOX_FONT_MIN), "above"
+    safe_text = _sanitize_text_for_render("→ " + (correction_text or ""))
+    if not safe_text:
+        return fitz.Rect(0, 0, 0, 0), float(SPELL_BOX_FONT_MIN), "above"
+    word_w = word_rect.width
+    word_h = word_rect.height
+    box_w = max(word_w + 2 * SPELL_BOX_PADDING_PT, SPELL_BOX_MIN_WIDTH_PT)
+    box_w = min(box_w, page_rect.width * 0.5)
+    font_size = float(SPELL_BOX_FONT_START)
+    for _ in range(20):
+        tw = fitz.get_text_length(safe_text, fontname="hebo", fontsize=font_size)
+        if tw <= box_w - 2 * SPELL_BOX_PADDING_PT or font_size <= SPELL_BOX_FONT_MIN:
+            break
+        font_size = max(SPELL_BOX_FONT_MIN, font_size - 0.5)
+    line_height_pt = font_size * 1.2
+    box_h = 2 * SPELL_BOX_PADDING_PT + line_height_pt
+    page_top = page_rect.y0
+    page_bottom = page_rect.y1
+    page_left = page_rect.x0
+    page_right = page_rect.x1
+    center_x = word_rect.x0 + word_rect.width / 2.0
+    box_x0 = center_x - box_w / 2.0
+    box_x1 = box_x0 + box_w
+    if box_x0 < page_left:
+        box_x0 = page_left
+        box_x1 = box_x0 + box_w
+    if box_x1 > page_right:
+        box_x1 = page_right
+        box_x0 = box_x1 - box_w
+    placement = "above"
+    box_y1_above = word_rect.y0 - SPELL_BOX_GAP_PT
+    box_y0_above = box_y1_above - box_h
+    if box_y0_above >= page_top:
+        box_y0 = box_y0_above
+        box_y1 = box_y1_above
+        placement = "above"
+    else:
+        box_y0 = word_rect.y1 + SPELL_BOX_GAP_PT
+        box_y1 = box_y0 + box_h
+        placement = "below"
+    if box_y1 > page_bottom:
+        box_y1 = page_bottom
+        box_y0 = box_y1 - box_h
+    if box_y0 < page_top:
+        box_y0 = page_top
+        box_y1 = box_y0 + box_h
+    box_rect = fitz.Rect(box_x0, box_y0, box_x1, box_y1)
+    gap = SPELL_BOX_GAP_PT
+    for _ in range(10):
+        overlap = False
+        for ex in existing_boxes:
+            if (
+                box_rect.y1 + gap > ex.y0
+                and box_rect.y0 - gap < ex.y1
+                and box_rect.x1 > ex.x0
+                and box_rect.x0 < ex.x1
+            ):
+                overlap = True
                 break
-    
-    return None
+        if not overlap:
+            break
+        box_y0 -= box_h + gap
+        box_y1 -= box_h + gap
+        if box_y0 < page_top:
+            box_y0 = word_rect.y1 + SPELL_BOX_GAP_PT
+            box_y1 = box_y0 + box_h
+            placement = "below"
+        box_rect = fitz.Rect(box_x0, box_y0, box_x1, box_y1)
+    return box_rect, font_size, placement
+
+
+def _draw_single_spelling_annotation(
+    page: "fitz.Page",
+    word_rect: "fitz.Rect",
+    correction_text: str,
+    page_rect: "fitz.Rect",
+    existing_boxes: Optional[List["fitz.Rect"]] = None,
+) -> Tuple[Optional["fitz.Rect"], Optional["fitz.Rect"], str]:
+    """
+    Draw one spelling annotation: box (above or below word), connector line, and red correction text.
+    Returns (word_rect, box_rect, status) for debug where status is "drawn" or "clamped".
+    """
+    box_rect, font_size, placement = _compute_spelling_box_geometry(
+        word_rect, correction_text, page_rect, existing_boxes
+    )
+    if box_rect.is_empty or box_rect.width <= 0 or box_rect.height <= 0:
+        return word_rect, None, "clamped"
+    safe_text = _sanitize_text_for_render("→ " + (correction_text or ""))
+    if not safe_text:
+        return word_rect, box_rect, "drawn"
+    word_center_x = word_rect.x0 + word_rect.width / 2.0
+    word_center_y = (word_rect.y0 + word_rect.y1) / 2.0
+    box_center_x = box_rect.x0 + box_rect.width / 2.0
+    if placement == "above":
+        conn_start = fitz.Point(box_center_x, box_rect.y1)
+        conn_end = fitz.Point(word_center_x, word_rect.y0)
+    else:
+        conn_start = fitz.Point(box_center_x, box_rect.y0)
+        conn_end = fitz.Point(word_center_x, word_rect.y1)
+    shape = page.new_shape()
+    shape.draw_line(conn_start, conn_end)
+    shape.finish(color=SPELL_COLOR, width=SPELL_CONNECTOR_WIDTH)
+    shape.commit()
+    page.draw_rect(box_rect, color=SPELL_COLOR, fill=(1, 1, 1), width=1.0)
+    text_y = box_rect.y0 + SPELL_BOX_PADDING_PT + font_size * 0.3
+    text_x = box_rect.x0 + SPELL_BOX_PADDING_PT
+    page.insert_text(
+        fitz.Point(text_x, text_y),
+        safe_text,
+        fontsize=font_size,
+        color=SPELL_COLOR,
+        fontname="hebo",
+    )
+    if DEBUG_SPELL_DRAW:
+        print(
+            "SPELL_DRAW: word_rect=(%.1f,%.1f,%.1f,%.1f) box_rect=(%.1f,%.1f,%.1f,%.1f) font=%.1f placement=%s"
+            % (word_rect.x0, word_rect.y0, word_rect.x1, word_rect.y1, box_rect.x0, box_rect.y0, box_rect.x1, box_rect.y1, font_size, placement)
+        )
+    return word_rect, box_rect, "drawn"
+
 
 def _add_spelling_annotations_to_pdf(
     pil_images: List[Image.Image],
@@ -860,7 +1250,7 @@ def _add_spelling_annotations_to_pdf(
     
     # Now add spelling annotations using PyMuPDF
     pages_data = ocr_data.get("pages", [])
-    
+    page_boxes: Dict[int, List[fitz.Rect]] = {}
     for error in spelling_errors:
         page_num = error.get("page", 1) - 1  # Convert to 0-indexed
         if page_num < 0 or page_num >= len(pdf_doc):
@@ -881,42 +1271,135 @@ def _add_spelling_annotations_to_pdf(
         if not wordrects:
             continue
         
-        # Find the error location
-        rect = _find_error_word_span_fitz(wordrects, error_text, anchor_quote)
+        # Find the error location (wordrects already sorted by reading order)
+        rect, _match_method = _find_error_word_span_fitz(wordrects, error_text, anchor_quote)
         if not rect:
             continue
         
-        # Draw red rectangle around error
-        page.draw_rect(rect, color=(0.8, 0, 0), width=2.0)
-        
-        # Draw correction text above the error
-        correction_text = _sanitize_text_for_render(f"→ {correction}")
-        if not correction_text:
-            continue
-        text_width = fitz.get_text_length(correction_text, fontname="hebo", fontsize=10)
-        
-        # White background for correction text
-        bg_rect = fitz.Rect(
-            rect.x0 - 2,
-            rect.y0 - 16,
-            rect.x0 + text_width + 4,
-            rect.y0 - 2
+        # Draw red rectangle around incorrect word
+        page.draw_rect(rect, color=SPELL_COLOR, width=2.0)
+        # Dedicated spelling placement: box above word, connector, red correction text
+        page_rect = page.rect
+        existing_on_page = page_boxes.get(page_num, [])
+        _wr, box_rect, _ = _draw_single_spelling_annotation(
+            page, rect, correction, page_rect, existing_boxes=existing_on_page
         )
-        page.draw_rect(bg_rect, color=(0.8, 0, 0), fill=(1, 1, 1), width=1.0)
-        
-        # Insert correction text
-        text_point = fitz.Point(rect.x0, rect.y0 - 4)
-        page.insert_text(
-            text_point,
-            correction_text,
-            fontsize=10,
-            color=(0.8, 0, 0),
-            fontname="hebo"
-        )
+        if box_rect and not box_rect.is_empty:
+            page_boxes.setdefault(page_num, []).append(box_rect)
     
     # Save the annotated PDF
     pdf_doc.save(output_path)
     pdf_doc.close()
+
+
+def add_spelling_annotations_to_merged_pdf(
+    output_pdf_path: str,
+    ocr_data: Dict[str, Any],
+    spelling_errors: List[Dict[str, Any]],
+    answer_start_page_0indexed: int,
+    first_answer_page_1based: int,
+    page_transforms: List[Tuple[float, float, float]],
+) -> List[Dict[str, Any]]:
+    """
+    Add spelling annotations to the already-merged output PDF (report + answer pages).
+    Only touches answer pages. Each entry in page_transforms is (scale_pt, x0, y0) mapping
+    source page coordinates to the content area on the corresponding merged answer page.
+    Returns a list of placement records for debug: page, error_text, correction, matched_rect, box_rect, status.
+    """
+    placement_results: List[Dict[str, Any]] = []
+    if not spelling_errors or not page_transforms:
+        return placement_results
+    try:
+        pdf_doc = fitz.open(output_pdf_path)
+    except Exception:
+        return placement_results
+    pages_data = ocr_data.get("pages", [])
+    page_boxes: Dict[int, List[fitz.Rect]] = {}
+    try:
+        for error in spelling_errors:
+            src_page_1 = int(error.get("page", 1))
+            page_off = src_page_1 - first_answer_page_1based
+            if page_off < 0 or page_off >= len(page_transforms):
+                continue
+            merged_idx = answer_start_page_0indexed + page_off
+            if merged_idx < 0 or merged_idx >= len(pdf_doc):
+                continue
+            scale_pt, x0, y0 = page_transforms[page_off]
+            page = pdf_doc[merged_idx]
+            page_info_idx = src_page_1 - 1
+            if page_info_idx < 0 or page_info_idx >= len(pages_data):
+                continue
+            page_info = pages_data[page_info_idx]
+            error_text = error.get("error_text", "")
+            correction = error.get("correction", "")
+            anchor_quote = error.get("anchor_quote")
+            if not error_text or not correction:
+                continue
+            wordrects = _word_rects_in_page_coords_fitz(page_info)
+            anchor_quote_present = anchor_quote is not None and bool((anchor_quote or "").strip())
+            if not wordrects:
+                placement_results.append({
+                    "page": src_page_1,
+                    "error_text": error_text,
+                    "correction": correction,
+                    "anchor_quote_present": anchor_quote_present,
+                    "anchor_match_used": False,
+                    "match_method": "not_found",
+                    "matched_rect": None,
+                    "box_rect": None,
+                    "status": "not_found",
+                })
+                continue
+            rect, match_method = _find_error_word_span_fitz(wordrects, error_text, anchor_quote)
+            if not rect:
+                placement_results.append({
+                    "page": src_page_1,
+                    "error_text": error_text,
+                    "correction": correction,
+                    "anchor_quote_present": anchor_quote_present,
+                    "anchor_match_used": False,
+                    "match_method": match_method,
+                    "matched_rect": None,
+                    "box_rect": None,
+                    "status": "not_found",
+                })
+                if DEBUG_SPELL_MATCH:
+                    print("[SPELL] page=%s err=%r method=%s matched=False" % (src_page_1, error_text, match_method))
+                continue
+            merged_rect = fitz.Rect(
+                x0 + rect.x0 * scale_pt,
+                y0 + rect.y0 * scale_pt,
+                x0 + rect.x1 * scale_pt,
+                y0 + rect.y1 * scale_pt,
+            )
+            page.draw_rect(merged_rect, color=SPELL_COLOR, width=2.0)
+            page_rect = page.rect
+            existing_on_page = page_boxes.get(merged_idx, [])
+            _wr, box_rect, status = _draw_single_spelling_annotation(
+                page, merged_rect, correction, page_rect, existing_boxes=existing_on_page
+            )
+            if box_rect and not box_rect.is_empty:
+                page_boxes.setdefault(merged_idx, []).append(box_rect)
+            placement_results.append({
+                "page": src_page_1,
+                "error_text": error_text,
+                "correction": correction,
+                "anchor_quote_present": anchor_quote_present,
+                "anchor_match_used": (match_method == "anchor_window"),
+                "match_method": match_method,
+                "matched_rect": [merged_rect.x0, merged_rect.y0, merged_rect.x1, merged_rect.y1],
+                "box_rect": [box_rect.x0, box_rect.y0, box_rect.x1, box_rect.y1] if box_rect else None,
+                "status": status,
+            })
+            if DEBUG_SPELL_MATCH:
+                print("[SPELL] page=%s err=%r method=%s matched=True" % (src_page_1, error_text, match_method))
+    finally:
+        try:
+            pdf_doc.save(output_pdf_path, incremental=False)
+        except Exception:
+            pass
+        pdf_doc.close()
+    return placement_results
 
 
 # ============================================================
@@ -1023,7 +1506,7 @@ def annotate_pdf_essay_pages(
         tick_y = max(5 + tick_size, min(tick_y, orig_h - margin_px - 5))
         _draw_red_tick(canvas, x=tick_x, y=tick_y, size=tick_size, thickness=tick_thickness)
 
-        # LEFT MARGIN: Improvements
+        # LEFT MARGIN: Improvements (single column, vertical stack, fit to page)
         cv2.putText(
             canvas,
             _sanitize_text_for_render(f"Page {page_number} - Improvements"),
@@ -1036,77 +1519,62 @@ def annotate_pdf_essay_pages(
         )
 
         left_pad = 10
-        col_gap = 14
-        # When the left margin is narrower (after making margins equal),
-        # using 2 columns makes boxes too skinny and causes excessive wrapping.
-        # Use 1 column for narrow margins; keep 2 columns for wide margins.
-        max_cols = 1 if left_width < int(0.50 * orig_w) else 2
-        col_w = (left_width - 2 * margin_px - (max_cols - 1) * col_gap) // max_cols
-        col_x = margin_px
-        col_idx = 0
-        y_cur = y_offset + 120
+        col_w = left_width - 2 * margin_px  # full width, single column only
+        max_bottom_left = orig_h - margin_px
+        y_start = y_offset + 120
+        thick = 2
+        line_g = 18
 
-        for bullet in suggestions_by_page.get(page_number, [])[:6]:
-            bullet_text = str(bullet).strip()
-            if not bullet_text:
-                continue
-            bullet_full = "- " + bullet_text
+        bullets = [("- " + str(b).strip(),) for b in suggestions_by_page.get(page_number, [])[:6] if str(b).strip()]
+        left_fitted: List[Dict[str, Any]] = []
 
-            thick = 2
-            line_g = 18
-            top_pad = 20
-            bottom_pad = 20
-
-            remaining_h = (orig_h - margin_px) - y_cur
-            if remaining_h < 160:
-                col_idx += 1
-                if col_idx >= max_cols:
-                    col_idx = max_cols - 1
-                    y_cur = y_offset + 120
-                col_x = margin_px + col_idx * (col_w + col_gap)
-
-            font_s, wrapped_lines, box_h = _fit_text_box(
+        # Pass 1: compute fitted box for each bullet, stack vertically (no side-by-side)
+        y_cur = y_start
+        for (bullet_full,) in bullets:
+            max_avail_h = max(60, max_bottom_left - y_cur - LEFT_BOX_MIN_GAP)
+            font_s, wrapped_lines, box_h, overflow_truncated = _fit_left_annotation_box(
                 bullet_full,
                 max_width_px=col_w - 2 * left_pad,
-                max_height_px=min((orig_h - margin_px) - y_cur, 1200),
+                max_height_px=max_avail_h,
                 start_scale=1.55,
                 thickness=thick,
                 line_gap=line_g,
-                top_pad=top_pad,
-                bottom_pad=bottom_pad,
-                min_scale=1.00,
+                top_pad=LEFT_BOX_TOP_PAD,
+                bottom_pad=LEFT_BOX_BOTTOM_PAD,
+                min_scale=0.55,
             )
-
-            if y_cur + box_h > (orig_h - margin_px):
-                col_idx += 1
-                if col_idx >= max_cols:
-                    col_idx = max_cols - 1
-                    y_cur = y_offset + 120
-                col_x = margin_px + col_idx * (col_w + col_gap)
-
-            bx1 = col_x
-            bx2 = col_x + col_w
             by1 = y_cur
             by2 = y_cur + box_h
+            if by2 > max_bottom_left:
+                by2 = max_bottom_left
+                by1 = by2 - box_h
+            left_fitted.append({
+                "bx1": margin_px,
+                "bx2": margin_px + col_w,
+                "by1": by1,
+                "by2": by2,
+                "lines": wrapped_lines,
+                "font_s": font_s,
+                "box_h": box_h,
+                "overflow_truncated": overflow_truncated,
+            })
+            y_cur = by2 + LEFT_BOX_MIN_GAP
+            if y_cur >= max_bottom_left:
+                break
 
-            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 0, 0), 2)
-
-            y_text = by1 + top_pad
-            for ln in wrapped_lines:
-                (_, th), _ = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX, font_s, thick)
-                cv2.putText(
-                    canvas,
-                    ln,
-                    (bx1 + left_pad, y_text + th),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_s,
-                    (0, 0, 0),
-                    thick,
-                    cv2.LINE_AA,
-                )
-                y_text += th + line_g
-
-            y_cur += box_h + 18
+        # Pass 2: draw boxes and text from finalized geometry (no extra line_gap after last line)
+        for f in left_fitted:
+            cv2.rectangle(canvas, (f["bx1"], f["by1"]), (f["bx2"], f["by2"]), (0, 0, 0), 2)
+            _draw_lines_at(
+                canvas,
+                f["bx1"] + left_pad,
+                f["by1"] + LEFT_BOX_TOP_PAD,
+                f["lines"],
+                f["font_s"],
+                thick,
+                (0, 0, 0),
+                line_gap=line_g,
+            )
 
         # OPTIONAL DEBUG: draw OCR line boxes
         if debug_draw_ocr_boxes and page_ocr and page_ocr.get("lines"):
@@ -1247,9 +1715,15 @@ def annotate_pdf_essay_pages(
                 print(f"     has_anchor={item['has_anchor']}")
                 print(f"     candidate_preview={item['primary_candidate_preview'][:120]}")
 
-        # RIGHT MARGIN LAYOUT (no overlap). Matching/anchors removed; all callouts are page-level in input order.
+        # RIGHT MARGIN LAYOUT — two-pass: compute geometry then draw (no overlap, text inside box).
         box_w = int(right_width - 2 * margin_px)
-        resolved_callouts: List[Dict[str, Any]] = []
+        gap = 12
+        max_bottom = orig_h - margin_px
+        avail_h = max(1, max_bottom - margin_px)
+        l_gap = 20
+
+        # Pass 1: build resolved_callouts (header, body, y_sort).
+        resolved_callouts = []
         for idx, a in enumerate(anns):
             a_type = (a.get("type") or "").strip()
             rubric_point = (a.get("rubric_point") or "").strip()
@@ -1258,7 +1732,7 @@ def annotate_pdf_essay_pages(
             header = f"[{a_type}] {rubric_point}".strip()
             body = (comment + (f"  Fix: {correction}" if correction else "")).strip()
             if a_type != "grammar_language" and correction:
-                body = (comment ).strip()
+                body = (comment).strip()
             resolved_callouts.append({
                 "rect": None,
                 "header": header,
@@ -1268,71 +1742,134 @@ def annotate_pdf_essay_pages(
             })
         resolved_callouts.sort(key=lambda x: x["y_sort"])
 
-        gap = 12
-        max_bottom = orig_h - margin_px
-        avail_h = max(1, max_bottom - margin_px)
+        if not resolved_callouts:
+            annotated_pages.append(Image.fromarray(canvas[:, :, ::-1]))
+            continue
 
-        def _total_height(h_scale: float, b_scale: float, line_gap: int) -> Tuple[int, List[int]]:
-            heights: List[int] = []
-            total = 0
-            for it in resolved_callouts:
-                h_h = _estimate_text_height(it["header"], h_scale, 2, box_w - 24, line_gap=line_gap)
-                b_h = _estimate_text_height(it["body"], b_scale, 2, box_w - 24, line_gap=line_gap)
-                box_h = h_h + b_h + 72
-                heights.append(box_h)
-                total += box_h
-            if heights:
-                total += gap * (len(heights) - 1)
-            return total, heights
+        # Pass 2: fit text per box, then resolve collisions and clamp to page.
+        tentative_max_h = max(80, (avail_h - gap * (len(resolved_callouts) - 1)) // len(resolved_callouts))
+        fitted: List[Dict[str, Any]] = []
+        for item in resolved_callouts:
+            header_scale, body_scale, header_lines, body_lines, box_h, overflow_truncated = _fit_right_annotation_box(
+                item["header"],
+                item["body"],
+                box_w,
+                tentative_max_h,
+                thickness=2,
+                line_gap=l_gap,
+            )
+            fitted.append({
+                "header_lines": header_lines,
+                "body_lines": body_lines,
+                "header_scale": header_scale,
+                "body_scale": body_scale,
+                "box_h": box_h,
+                "overflow_truncated": overflow_truncated,
+            })
 
-        header_scale = 1.35
-        body_scale = 1.25
-        l_gap = 20
-
-        # If boxes won't fit, step down scales until they do.
-        for step in range(6):
-            hs = header_scale - 0.05 * step
-            bs = body_scale - 0.05 * step
-            if hs < 1.05 or bs < 1.0:
-                break
-            total_h, box_heights = _total_height(hs, bs, l_gap)
-            if total_h <= avail_h:
-                header_scale = hs
-                body_scale = bs
-                break
-
-        _, box_heights = _total_height(header_scale, body_scale, l_gap)
-
-        last_bottom_y = margin_px
-        for item, box_h in zip(resolved_callouts, box_heights):
-            rect = item["rect"]
-            header = item["header"]
-            body = item["body"]
-
-            bx1 = left_width + orig_w + margin_px
-            bx2 = bx1 + box_w
-
-            # Stack top-to-bottom without collisions; anchor near rect if present
-            desired_y = rect[1] - 20 if rect else last_bottom_y + gap
-            start_y = max(margin_px, last_bottom_y + gap, desired_y)
-
-            by1 = int(start_y)
-            by2 = int(by1 + box_h)
-
-            # Ensure box stays within page bounds
+        # Collision resolution: desired_y for first = margin_px, rest = previous by2 + gap; then push down.
+        min_gap = RIGHT_BOX_MIN_GAP
+        desired_by1 = margin_px
+        for i in range(len(fitted)):
+            f = fitted[i]
+            by1 = int(desired_by1)
+            by2 = int(by1 + f["box_h"])
             if by2 > max_bottom:
                 by2 = max_bottom
-                by1 = max(margin_px, by2 - box_h)
+                by1 = max(margin_px, by2 - f["box_h"])
+                # If clamping causes overlap with previous, shrink this box and re-fit
+                if i > 0 and by1 < fitted[i - 1].get("by2", 0) + min_gap:
+                    shrink_max_h = max(60, (max_bottom - margin_px) - (fitted[i - 1].get("by2", 0) + min_gap))
+                    if shrink_max_h >= 60:
+                        header_scale2, body_scale2, header_lines2, body_lines2, box_h2, overflow_trunc2 = _fit_right_annotation_box(
+                            resolved_callouts[i]["header"],
+                            resolved_callouts[i]["body"],
+                            box_w,
+                            shrink_max_h,
+                            thickness=2,
+                            line_gap=l_gap,
+                        )
+                        fitted[i] = {
+                            "header_lines": header_lines2,
+                            "body_lines": body_lines2,
+                            "header_scale": header_scale2,
+                            "body_scale": body_scale2,
+                            "box_h": box_h2,
+                            "overflow_truncated": overflow_trunc2,
+                        }
+                        by1 = fitted[i - 1].get("by2", margin_px) + min_gap
+                        by2 = by1 + fitted[i]["box_h"]
+                        if by2 > max_bottom:
+                            by2 = max_bottom
+                            by1 = max(margin_px, by2 - fitted[i]["box_h"])
+            f["by1"] = by1
+            f["by2"] = by2
+            desired_by1 = by2 + gap
 
-            last_bottom_y = by2
+        # Enforce minimum gap: push down any box that overlaps the previous.
+        for i in range(1, len(fitted)):
+            prev_bottom = fitted[i - 1]["by2"]
+            need_y = prev_bottom + min_gap
+            if fitted[i]["by1"] < need_y:
+                by1 = need_y
+                by2 = by1 + fitted[i]["box_h"]
+                if by2 > max_bottom:
+                    by2 = max_bottom
+                    by1 = max(margin_px, by2 - fitted[i]["box_h"])
+                fitted[i]["by1"] = by1
+                fitted[i]["by2"] = by2
+        # If clamping created overlap, shrink overlapping boxes and recompute.
+        for i in range(1, len(fitted)):
+            prev_bottom = fitted[i - 1]["by2"]
+            if fitted[i]["by1"] < prev_bottom + min_gap:
+                shrink_max_h = max(60, max_bottom - (prev_bottom + min_gap))
+                header_scale2, body_scale2, header_lines2, body_lines2, box_h2, overflow_trunc2 = _fit_right_annotation_box(
+                    resolved_callouts[i]["header"],
+                    resolved_callouts[i]["body"],
+                    box_w,
+                    shrink_max_h,
+                    thickness=2,
+                    line_gap=l_gap,
+                )
+                fitted[i] = {
+                    "header_lines": header_lines2,
+                    "body_lines": body_lines2,
+                    "header_scale": header_scale2,
+                    "body_scale": body_scale2,
+                    "box_h": box_h2,
+                    "overflow_truncated": overflow_trunc2,
+                }
+                by1 = prev_bottom + min_gap
+                by2 = by1 + box_h2  # box_h2 <= shrink_max_h so by2 <= max_bottom
+                fitted[i]["by1"] = by1
+                fitted[i]["by2"] = by2
 
-            # highlight + connector only if rect exists
+        if DEBUG_RIGHT_BOX_LAYOUT:
+            for i, f in enumerate(fitted):
+                prev_y1 = fitted[i - 1]["by2"] if i > 0 else margin_px
+                gap_used = f["by1"] - prev_y1
+                overlap_adj = max(0, RIGHT_BOX_MIN_GAP - gap_used) if i > 0 else 0
+                print(f"  right_box[{i}] y0={f['by1']} y1={f['by2']} height={f['box_h']} "
+                      f"font_header={f['header_scale']:.2f} font_body={f['body_scale']:.2f} "
+                      f"overflow_truncated={f['overflow_truncated']} overlap_adjustment_px={overlap_adj}")
+
+        # Pass 3: draw using finalized geometry and precomputed lines only.
+        bx1 = left_width + orig_w + margin_px
+        bx2 = bx1 + box_w
+        for i, item in enumerate(resolved_callouts):
+            f = fitted[i]
+            by1, by2 = f["by1"], f["by2"]
             cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-            h_h = _estimate_text_height(header, header_scale, 2, box_w - 24, line_gap=l_gap)
-            _draw_wrapped_text(canvas, bx1 + 12, by1 + 28, header, header_scale, 2, box_w - 24, (0, 0, 255), line_gap=l_gap)
-            _draw_wrapped_text(canvas, bx1 + 12, by1 + 36 + h_h, body, body_scale, 2, box_w - 24, (0, 0, 0), line_gap=l_gap)
-
-            # Intentionally omit on-page highlights/connectors to avoid overlaying essay content.
+            header_y = by1 + _RIGHT_BOX_TOP_PAD
+            h_drawn = _draw_lines_at(
+                canvas, bx1 + 12, header_y, f["header_lines"],
+                f["header_scale"], 2, (0, 0, 255), line_gap=l_gap,
+            )
+            body_y = by1 + _RIGHT_BOX_TOP_PAD + h_drawn + _RIGHT_BOX_HEADER_BODY_GAP
+            _draw_lines_at(
+                canvas, bx1 + 12, body_y, f["body_lines"],
+                f["body_scale"], 2, (0, 0, 0), line_gap=l_gap,
+            )
 
         annotated_pages.append(Image.fromarray(canvas[:, :, ::-1]))
 

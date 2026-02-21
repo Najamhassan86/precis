@@ -1,14 +1,14 @@
 {
   "grading": {
-    "question_text": "precis while message. Following are the a two examples; n Exercise 1: Write a precis of the following passage and suggest a suitable structce title. vith time",
-    "question_statement_text": "A drop of water fell out of the cloud into the sea, and finding itself lost in such an immensity of fluid matter, broke out into the following reflection: \"Alas! What an inconsiderable creature am I in this prodigious ocean of waters. My existence is of no the concern in the universe; I am reduced to a kind of nothing, and I am the least of the past tuation works of God\". It so happened that an oyster which lay in the neighbourhood of this drop e ca chanced to gape and swallow it up in the midst of this soliloquy. The drop, say the fables, text lay a great while hardening in the shell until by degrees it was ripened into a pearl, falling the pois into the hands of a diver, after a long series of adventures, is at present that famous pearl and such which is fixed on the top of the Persian crown. s thatre CS CamScanner",
-    "topic": "Transformation of an insignificant drop into a precious pearl",
-    "student_title": "Drop of Water",
-    "student_precis_text": "Once, a drop of water fell from the cloud into the sea on which its existence was tiny and negligible and sad. Suddenly an oyster swallowed it. After passing through hardening processes it turned into a pearl. At last this pearl founded by a diver and fixed on the Persian crown by passing through many hands.",
-    "original_passage_word_count": 148,
-    "required_precis_word_count": 49,
-    "student_precis_word_count": 56,
-    "length_status": "Too Long",
+    "question_text": "PART-II Q.2 Write a précis of the following passage and suggest a suitable title. (20)",
+    "question_statement_text": "It will be said that, while a little leisure is pleasant, men would not know how to fill their days if they had only four hours of work out of the twenty-four. In so far as this is true in the modern world, it is a condemnation of our civilization; it would not have been true at any earlier period. There was formerly a capacity for light-heartedness and play which has been to some extent inhibited by the cult of efficiency. The modern man thinks that everything ought to be done for the sake of something else, and never for its own sake. Serious-minded persons, for example, are continually condemning the habit of going to the cinema, and telling us that it leads the young into crime. But all the work that goes to producing a cinema is respectable, because it is work, and because it brings a money profit. The notion that the desirable activities are those that bring a profit has made everything topsy-turvy. The butcher who provides you with meat and the baker who provides you with bread are praiseworthy, because they are making money; but when you enjoy the food they have provided, you are merely frivolous, unless you eat only to get strength for your work. Broadly speaking, it is held that getting money is good and spending money is bad. Seeing that they are two sides of one transaction, this is absurd; one might as well maintain that keys are good, but keyholes are bad. Whatever merit there may be in the production of goods must be entirely derivative from the advantage to be obtained by consuming them. The individual, in our society, works for profit; but the social purpose of his work lies in the consumption of what he produces. It is this divorce between the individual and the social purpose of production that makes it so difficult for men to think clearly in a world in which profit-making is the incentive to industry. We think too much of production, and too little of consumption. One result is that we attach too little importance to enjoyment and simple happiness, and that we do not judge production by the pleasure that it gives to the consumer.",
+    "topic": "",
+    "student_title": "Precis",
+    "student_precis_text": "PRECIS AND COMPOSITION Title: Loss of Leisure in Profit-Driven World Modern society despite valuing efficiency and profit, has lost its capacity for leisure. play , and enjoyment for their own sake. Unlike earlier times, people today struggle to use free time meaningfully , as everything is judged by its economic usefulness. Activities are respected only when they generate profit, while enjoyment without economic purpose is seen as frivolous. This attitude leads to false belief that earning money is good whereas spending it is bad, even though production exists primarily to satisfy consumption. In reality. the social value of work lies in the use and enjoyment of what is produced. Excessive",
+    "original_passage_word_count": 372,
+    "required_precis_word_count": 124,
+    "student_precis_word_count": 110,
+    "length_status": "Too Short",
     "criteria": [
       {
         "id": "comprehension_understanding_of_passage",
@@ -16,7 +16,7 @@
         "marks_allocated": 3,
         "marks_awarded": 1,
         "rating": "Weak",
-        "key_comments": "Captures basic plot (drop to pearl) but omits key reflection on insignificance and fable tone; misses main idea of reversal of fortune."
+        "key_comments": "Partial achievement; response needs clearer coverage and tighter wording."
       },
       {
         "id": "clarity_expression_language",
@@ -24,47 +24,47 @@
         "marks_allocated": 3,
         "marks_awarded": 1,
         "rating": "Weak",
-        "key_comments": "Awkward, fragmented sentences like 'a drop into fell the from sad sea cloud'; lacks logical flow and precise expression."
+        "key_comments": "Partial achievement; response needs clearer coverage and tighter wording."
       },
       {
         "id": "brevity_conciseness",
         "criterion": "Brevity & Conciseness",
         "marks_allocated": 2,
-        "marks_awarded": 0,
-        "rating": "Weak",
-        "key_comments": "54 words exceeds 49 required (10% over limit); redundant phrases like 'passing through many hands' and 'passing through hardening processes'."
+        "marks_awarded": 1,
+        "rating": "Average",
+        "key_comments": "Compression is uneven; reduce peripheral detail and keep core points concise."
       },
       {
         "id": "organization_coherence",
         "criterion": "Organization & Coherence",
         "marks_allocated": 2,
-        "marks_awarded": 0,
-        "rating": "Weak",
-        "key_comments": "Disjointed sequence; abrupt jumps from drop's sadness to oyster to pearl without smooth transitions."
+        "marks_awarded": 1,
+        "rating": "Average",
+        "key_comments": "Organization is basic; transitions and sentence flow need improvement."
       },
       {
         "id": "original_tone_meaning",
         "criterion": "Original Tone & Meaning",
         "marks_allocated": 2,
         "marks_awarded": 1,
-        "rating": "Weak",
-        "key_comments": "Fails to retain fable's ironic, reflective tone; distorts by simplifying soliloquy to 'sad' without philosophical depth."
+        "rating": "Average",
+        "key_comments": "Partial achievement; response needs clearer coverage and tighter wording."
       },
       {
         "id": "originality_paraphrasing",
         "criterion": "Originality & Paraphrasing",
         "marks_allocated": 2,
         "marks_awarded": 1,
-        "rating": "Weak",
-        "key_comments": "Relies on source phrases like 'drop of water', 'pearl', 'Persian crown'; minimal rephrasing, some direct copying."
+        "rating": "Average",
+        "key_comments": "Partial achievement; response needs clearer coverage and tighter wording."
       },
       {
         "id": "grammar_presentation",
         "criterion": "Grammar, & Presentation",
         "marks_allocated": 1,
-        "marks_awarded": 0,
-        "rating": "Weak",
-        "key_comments": "Numerous grammatical errors, incomplete sentences, and poor punctuation; fragmented handwriting affects readability."
+        "marks_awarded": 1,
+        "rating": "Excellent",
+        "key_comments": "Partial achievement; response needs clearer coverage and tighter wording."
       },
       {
         "id": "title",
@@ -72,22 +72,21 @@
         "marks_allocated": 5,
         "marks_awarded": 2,
         "rating": "Weak",
-        "key_comments": "Concise (3 words) but vague and literal; misses core theme of transformation from insignificance to fame."
+        "key_comments": "Title is present but can be more specific and aligned with the central idea."
       }
     ],
-    "total_awarded": 6,
+    "total_awarded": 9,
     "overall_rating": "Weak",
     "reasons_for_low_score": [
-      "Incomplete comprehension: omits drop's philosophical reflection and fable structure.",
-      "Poor clarity and grammar: fragmented, awkward sentences hinder understanding.",
-      "Excessive length and lack of conciseness: 54 words vs. required 49, with redundancies.",
-      "Disjointed organization: no logical flow or transitions between events."
+      "Response is shorter than required one-third length and omits key supporting points.",
+      "Main ideas are only partially developed, so logical progression and clarity need improvement.",
+      "Language precision and paraphrasing control need refinement to preserve meaning without copying."
     ],
     "ideal_precis": {
-      "title": "Insignificant Drop's Rise to Fame",
-      "text": "A drop of water, lamenting its triviality amid the vast sea, was swallowed by a nearby oyster mid-soliloquy. Hardening gradually within the shell, it transformed into a pearl. After numerous adventures, it reached a diver's hands and now adorns the Persian crown as a renowned gem."
+      "title": "It Will Be",
+      "text": "It will be said that, while a little leisure is pleasant, men would not know how to fill their days if they had only four hours of work out of the twenty-four. In so far as this is true in the modern world, it is a condemnation of our civilization; it would not have been true at any earlier period. There was formerly a capacity for light-heartedness and play which has been to some extent inhibited by the cult of efficiency. The modern man thinks that everything ought to be done for the sake of something else, and never for its own sake."
     },
-    "overall_remarks": "Submission shows basic plot grasp but fails in structure, language, and fidelity to original; significant revision needed for clarity and proportion."
+    "overall_remarks": "Fallback grading used after repeated invalid model outputs; scores are conservative."
   },
   "criteria_template": [
     {
@@ -131,61 +130,126 @@
       "marks_allocated": 5
     }
   ],
-  "ocr_pages": 2,
+  "ocr_pages": 3,
   "annotations": [
     {
       "page": 2,
       "type": "title",
       "rubric_point": "Title",
-      "anchor_quote": "flourish of persian crown",
+      "anchor_quote": "Title: Loss of Leisure in Profit-Driven World",
       "target_word_or_sentence": "",
       "context_before": "",
       "context_after": "",
-      "correction": "Drop's Rise to Pearl",
-      "comment": "Concise (3 words) but vague/literal; capture essence of transformation from insignificance to fame."
+      "correction": "Title: Profit Obsession Erodes Leisure and Misvalues Consumption",
+      "comment": "Current title vague; sharpen to 5 words capturing essence of profit-driven loss of leisure and production-consumption moral."
+    },
+    {
+      "page": 2,
+      "type": "length_word_count",
+      "rubric_point": "Length & Word Count Adherence",
+      "anchor_quote": "Modern society despite valuing efficiency and profit, has lost its capacity for leisure. play , and enjoyment for their own sake. Unlike earlier times, people today struggle to use free time meaningfully , as everything is judged by its economic usefulness. Activities are respected only when they generate profit, while enjoyment without economic purpose is seen as frivolous. This attitude leads to false belief that earning money is good whereas spending it is bad, even though production exists primarily to satisfy consumption. In reality. the social value of work lies in the use and enjoyment of what is produced. Excessive",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "",
+      "comment": "~98 words; under target (~1/3 original ±10-15%); feels abruptly short, omits key supporting points."
+    },
+    {
+      "page": 2,
+      "type": "language_grammar",
+      "rubric_point": "Language, Expression, Grammar, Vocabulary & Originality",
+      "anchor_quote": "play , and enjoyment for their own sake.",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "play and enjoyment for their own sake.",
+      "comment": "Lowercase 'play'; remove extra space; flag potential copying of >4-word phrase."
     },
     {
       "page": 2,
       "type": "clarity_coherence",
       "rubric_point": "Clarity, Coherence & Logical Flow",
-      "anchor_quote": "Once, a drop into sad",
+      "anchor_quote": "In reality. the social value of work lies in the use and enjoyment of what is produced. Excessive",
       "target_word_or_sentence": "",
       "context_before": "",
       "context_after": "",
-      "correction": "Once, a sad drop fell into the sea,",
-      "comment": "Awkward/fragmented phrasing disrupts flow; complete sentence with logical sequence."
+      "correction": "In reality, the social value of work lies in using and enjoying its products; excessive",
+      "comment": "Fragmented punctuation; incomplete final sentence disrupts flow—complete and connect ideas."
     },
     {
       "page": 2,
+      "type": "originality_paraphrasing",
+      "rubric_point": "Language, Expression, Grammar, Vocabulary & Originality",
+      "anchor_quote": "production exists primarily to satisfy consumption",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "production serves consumption",
+      "comment": "Direct >5-word overlap with original; paraphrase concisely to own words."
+    },
+    {
+      "page": 3,
+      "type": "grammar_presentation",
+      "rubric_point": "Grammar/spelling/punctuation errors.",
+      "anchor_quote": "it's true purpose",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "its true purpose",
+      "comment": "Use 'its' (possessive) not 'it's' (contraction)."
+    },
+    {
+      "page": 3,
+      "type": "grammar_presentation",
+      "rubric_point": "Grammar/spelling/punctuation errors.",
+      "anchor_quote": "production ,",
+      "target_word_or_sentence": "",
+      "context_before": "",
+      "context_after": "",
+      "correction": "production,",
+      "comment": "Remove extraneous space before comma."
+    },
+    {
+      "page": 3,
       "type": "brevity_conciseness",
-      "rubric_point": "Brevity & Conciseness",
-      "anchor_quote": "by passing through many hands",
+      "rubric_point": "Compression & Conciseness",
+      "anchor_quote": "making it difficult to think clearly about human well-being",
       "target_word_or_sentence": "",
       "context_before": "",
       "context_after": "",
-      "correction": "passing through hands,",
-      "comment": "Redundant phrasing exceeds word limit (54 vs. 49); trim unnecessary words."
+      "correction": "obscuring human well-being",
+      "comment": "Compress wordy clause; eliminate unnecessary words."
     },
     {
-      "page": 2,
-      "type": "comprehensiveness",
-      "rubric_point": "Comprehensiveness & Coverage of Main Ideas",
-      "anchor_quote": "its tiny and negligible",
+      "page": 3,
+      "type": "brevity_conciseness",
+      "rubric_point": "Length & Word Count Adherence",
+      "anchor_quote": "Precis word count: 127 words",
       "target_word_or_sentence": "",
       "context_before": "",
       "context_after": "",
-      "correction": "its tiny, negligible existence",
-      "comment": "Mentions insignificance but omits deeper philosophical reflection and fable reversal."
+      "correction": "Target 110-140 words; expand core ideas omitted.",
+      "comment": "Slightly over target but feels short due to missing points."
     }
   ],
   "page_suggestions": [
     {
       "page": 2,
       "suggestions": [
-        "Revise title to capture transformation theme from insignificance to pearl.",
-        "Restructure fragmented sentences for clarity and logical flow, e.g., fix 'Once, a drop into sad'.",
-        "Cut redundancies like 'passing through many hands' to meet ~49-word target.",
-        "Add reflection on reversal of fortune and fable's ironic tone."
+        "Revise title for greater specificity to core moral on production serving consumption.",
+        "Expand precis to ~1/3 original length by adding omitted key ideas without fluff.",
+        "Paraphrase long copied phrases (>4 words) from original for originality.",
+        "Fix grammar, punctuation, and complete final incomplete sentence.",
+        "Improve logical flow with smoother transitions between ideas."
+      ]
+    },
+    {
+      "page": 3,
+      "suggestions": [
+        "Add a concise, specific title (4-8 words) capturing profit focus vs. human well-being.",
+        "Correct grammar, punctuation, and tighten wordy phrases for clarity and conciseness.",
+        "Expand to fully cover all major ideas while staying near 124-word target.",
+        "Improve logical flow with smoother transitions mirroring original sequence."
       ]
     }
   ],
