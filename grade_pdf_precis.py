@@ -73,6 +73,9 @@ DEFAULT_PRECIS_CRITERIA: List[Dict[str, Any]] = [
     {"id": "organization", "criterion": "Organization & Coherence", "marks_allocated": 2},
     {"id": "tone_meaning", "criterion": "Original Tone & Meaning", "marks_allocated": 2},
     {"id": "originality", "criterion": "Originality & Paraphrasing", "marks_allocated": 2},
+    # Grammar & Presentation: language-error counts (spelling_count, grammar_count) are available
+    # for possible future conservative integration; any deduction must remain bounded and must not
+    # dominate total score or conflict with primary rubric scoring.
     {"id": "grammar_presentation", "criterion": "Grammar & Presentation", "marks_allocated": 1},
     {"id": "title", "criterion": "Title", "marks_allocated": 5},
 ]
@@ -85,6 +88,10 @@ DEFAULT_MODELS: Dict[str, Dict[str, Any]] = {
 
 # Keep report text aligned with annotation-style readable text size.
 REPORT_BASE_TEXT_SIZE = 12.0
+
+# Student-facing PDF: do not use "Garbled text". Use neutral wording e.g. "Filtered OCR noise"
+# if ever showing filtered/removed content; keep technical terms in debug JSON/logs only.
+_STUDENT_PDF_NO_GARBLED_WORDING = True  # Sentinel for code review; no "Garbled text" in report.
 
 # Populated by _extract_answer_block_text for answer_extracted.json debug output.
 _LAST_ANSWER_BLOCK_DEBUG: Dict[str, Any] = {
@@ -677,7 +684,9 @@ def normalize_spelling_errors(
 ) -> List[Dict[str, Any]]:
     """
     Normalize spelling/grammar errors to a canonical shape; drop invalid entries; deduplicate.
-    Returns list of dicts with: page (int, 1-based), error_text, correction, anchor_quote (optional), category.
+    Returns list of dicts with: page (int, 1-based), error_text, correction, anchor_quote (optional),
+    category (backward compat: spelling | grammar_presentation), normalized_category (spelling | grammar).
+    normalized_category is the canonical spelling vs grammar label for counts and debug.
     """
     if num_pages <= 0:
         return []
@@ -701,6 +710,7 @@ def normalize_spelling_errors(
         if anchor_quote is not None:
             anchor_quote = str(anchor_quote).strip() or None
         etype = (err.get("type") or "").strip().lower()
+        normalized_category = "spelling" if etype == "spelling" else "grammar"
         category = "spelling" if etype == "spelling" else "grammar_presentation"
         key = (p, error_text, correction)
         if key in seen:
@@ -712,6 +722,7 @@ def normalize_spelling_errors(
             "correction": correction,
             "anchor_quote": anchor_quote,
             "category": category,
+            "normalized_category": normalized_category,
         })
     return out
 
@@ -759,15 +770,33 @@ def merge_report_and_annotated_answer(
     out_doc.close()
 
 
+# Precis rubric policy: Excellent band is capped at 12/20; scores above 12 must not be "Excellent".
+PRECIS_EXCELLENT_CAP = 12
+PRECIS_TOTAL_MARKS = 20
+
+
 def _normalize_rating(score: float, max_marks: float) -> str:
-    ratio = 0.0 if max_marks <= 0 else score / max_marks
-    if ratio >= 0.85:
-        return "Excellent"
-    if ratio >= 0.70:
-        return "Good"
+    if max_marks <= 0:
+        return "Weak"
+    score_f = float(score)
+    # Scale excellent cap if total is not 20 (e.g. custom rubric).
+    excellent_cap = PRECIS_EXCELLENT_CAP * max_marks / float(PRECIS_TOTAL_MARKS)
+    if score_f > excellent_cap:
+        # Above Excellent cap: assign next band (Good) by ratio.
+        ratio = score_f / max_marks
+        if ratio >= 0.70:
+            return "Good"
+        if ratio >= 0.50:
+            return "Average"
+        return "Weak"
+    ratio = score_f / max_marks
     if ratio >= 0.50:
-        return "Average"
-    return "Weak"
+        return "Excellent"  # 10-12 when total is 20
+    if ratio >= 0.35:
+        return "Good"  # 7-9
+    if ratio >= 0.20:
+        return "Average"  # 4-6
+    return "Weak"  # 0-3
 
 
 def _infer_length_status(original_words: int, required_words: int, student_words: int) -> str:
@@ -1250,7 +1279,9 @@ def _clean_question_text(text: str) -> str:
     return s
 
 
-def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
+def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Extract question and passage text from page-1 OCR. Returns (question_text, statement_text, debug_dict)."""
+    _debug_empty = {"extraction_method": "none", "page1_text_length": 0, "passage_start_index": None, "raw_line_count": 0, "used_word_rows": False}
     pages = ocr_data.get("pages") or []
     page1 = None
     for p in pages:
@@ -1258,7 +1289,7 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
             page1 = p
             break
     if not page1:
-        return "", ""
+        return "", "", _debug_empty
 
     lines = page1.get("lines") or []
     words = page1.get("words") or []
@@ -1311,12 +1342,14 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
             line_items.append((y, text))
 
     line_items.sort(key=lambda x: x[0])
+    used_word_rows = bool(words)
+    raw_line_count = len(line_items)
     if not line_items:
-        return "", ""
+        return "", "", {**_debug_empty, "raw_line_count": 0, "used_word_rows": used_word_rows}
 
     page1_text = _norm_ws("\n".join([t for _, t in line_items if t]))
     if not page1_text:
-        return "", ""
+        return "", "", {**_debug_empty, "raw_line_count": raw_line_count, "used_word_rows": used_word_rows}
 
     # Prioritized patterns ordered by specificity (most specific first)
     # Format: (pattern, priority_score) where higher score = higher priority
@@ -1417,7 +1450,14 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
         question_text = _clean_question_text(question_text)
         statement_text = _clean_question_text(statement_text)
 
-        return question_text, statement_text
+        debug = {
+            "extraction_method": "passage_anchor",
+            "page1_text_length": len(page1_text),
+            "passage_start_index": passage_start_idx,
+            "raw_line_count": raw_line_count,
+            "used_word_rows": used_word_rows,
+        }
+        return question_text, statement_text, debug
 
     # Fallback when anchors are missing.
     question_lines: List[str] = []
@@ -1440,7 +1480,14 @@ def _extract_question_blocks(ocr_data: Dict[str, Any]) -> Tuple[str, str]:
 
     q_fallback = _clean_question_text(_norm_ws(" ".join(question_lines)))
     s_fallback = _clean_question_text(_norm_ws(" ".join(statement_lines)))
-    return q_fallback, s_fallback
+    debug = {
+        "extraction_method": "fallback",
+        "page1_text_length": len(page1_text),
+        "passage_start_index": None,
+        "raw_line_count": raw_line_count,
+        "used_word_rows": used_word_rows,
+    }
+    return q_fallback, s_fallback, debug
 
 
 def call_grok_for_precis_grading(
@@ -1469,7 +1516,7 @@ def call_grok_for_precis_grading(
     answer_fragmented_handwriting = bool(answer_debug.get("fragmented_handwriting", False))
     answer_used_word_fallback = bool(answer_debug.get("used_word_fallback", False))
     answer_word_count_words = int(answer_debug.get("word_count_words", 0) or 0)
-    question_block_text, question_statement_block_text = _extract_question_blocks(ocr_data)
+    question_block_text, question_statement_block_text, _ = _extract_question_blocks(ocr_data)
     answer_page_images = [p for p in page_images if int(p.get("page") or 0) == 2]
     if not answer_page_images:
         answer_page_images = page_images
@@ -1528,8 +1575,13 @@ def call_grok_for_precis_grading(
         "- Follow the provided rubric criteria and marks exactly.\n"
         "- For each criterion, give marks_awarded as a whole number within [0, marks_allocated].\n"
         "- Add concise, evidence-based key_comments for each criterion.\n"
-        "- Provide total_awarded as the sum of marks_awarded values.\n"
-        "- Provide overall_rating from: Excellent, Good, Average, Weak.\n"
+        "- total_awarded MUST equal the sum of all criteria marks_awarded and MUST NOT exceed "
+        f"{PRECIS_EXCELLENT_CAP}; the maximum possible score is {PRECIS_EXCELLENT_CAP} (cap).\n"
+        "- Provide total_awarded as the sum of marks_awarded values, ensuring the sum is at most "
+        f"{PRECIS_EXCELLENT_CAP}.\n"
+        f"- Overall rating 'Excellent' is only allowed when total_awarded is at most {PRECIS_EXCELLENT_CAP}. "
+        "If total_awarded exceeds this cap, use 'Good', not 'Excellent'.\n"
+        "- Provide overall_rating from: Excellent, Good, Average, Weak (subject to the cap above).\n"
         "- reasons_for_low_score must contain only concrete weaknesses, not praise.\n"
         "- reasons_for_low_score must NOT contain 'No major weaknesses identified'.\n"
         "- If total_awarded is below 70% of total marks, reasons_for_low_score must contain at least 2 concrete items.\n"
@@ -1579,9 +1631,10 @@ def call_grok_for_precis_grading(
         "output_schema": schema_hint,
     }
 
-    def _validate(parsed: Dict[str, Any]) -> bool:
+    def _validate(parsed: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """Returns (passed, failure_reason). failure_reason is set when passed is False."""
         if not isinstance(parsed, dict):
-            return False
+            return False, "not a dict"
 
         crit = parsed.get("criteria")
         crit_list: List[Dict[str, Any]] = crit if isinstance(crit, list) else []
@@ -1623,7 +1676,7 @@ def call_grok_for_precis_grading(
         else:
             parsed["total_awarded"] = int(round(declared_total_f))
 
-        parsed["total_awarded"] = int(max(0, min(int(total_marks), int(parsed["total_awarded"]))))
+        parsed["total_awarded"] = int(max(0, min(PRECIS_EXCELLENT_CAP, int(parsed["total_awarded"]))))
 
         if parsed.get("overall_rating") not in ("Excellent", "Good", "Average", "Weak"):
             parsed["overall_rating"] = _normalize_rating(float(parsed["total_awarded"]), float(total_marks))
@@ -1669,22 +1722,23 @@ def call_grok_for_precis_grading(
         # Quality gates: reject low-quality but schema-valid outputs and force retry.
         all_marks_zero = all(int(c.get("marks_awarded", 0)) <= 0 for c in parsed["criteria"])
         if all_marks_zero:
-            return False
+            return False, "all criteria marks_awarded are zero"
         if not parsed["ideal_precis"]["text"]:
-            return False
+            return False, "ideal_precis.text is empty"
         reasons_lc = [str(x).strip().lower() for x in parsed["reasons_for_low_score"] if str(x).strip()]
         if not reasons_lc:
-            return False
+            return False, "reasons_for_low_score is empty"
         if any("no major weaknesses" in r for r in reasons_lc):
-            return False
+            return False, "reasons_for_low_score contains 'no major weaknesses'"
         if sw >= 30 and int(parsed.get("total_awarded", 0) or 0) == 0:
-            return False
-        return True
+            return False, "total_awarded is 0 but student_precis has 30+ words"
+        return True, None
 
     last_err: Optional[Exception] = None
-    # Limit retries so we do not waste time on repeatedly invalid JSON.
-    for attempt in range(2):
-        print(f"  Precis grading attempt {attempt + 1}/4...")
+    last_validation_reason: Optional[str] = None
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        print(f"  Precis grading attempt {attempt + 1}/{max_attempts}...")
         response = _grok_chat(
             grok_api_key,
             messages=[
@@ -1712,10 +1766,14 @@ def call_grok_for_precis_grading(
             last_err = e
             continue
 
-        if _validate(parsed):
+        ok, fail_reason = _validate(parsed)
+        if ok:
             print(f"  Precis grading validated on attempt {attempt + 1}.")
             return parsed
-        last_err = ValueError("Invalid grading JSON")
+        last_validation_reason = fail_reason
+        last_err = ValueError(f"Invalid grading JSON: {fail_reason}")
+        if fail_reason:
+            print(f"  Validation failed: {fail_reason}")
     print(f"  Warning: grading JSON remained incomplete after retries ({last_err}); using fallback normalization.")
     fallback_student_title = str(answer_title_hint or "").strip() or "Precis"
     fallback_student_text = str(answer_block_text or "").strip()
@@ -1818,13 +1876,14 @@ def call_grok_for_precis_grading(
         "student_precis_word_count": fallback_sw,
         "length_status": _infer_length_status(fallback_ow, fallback_rw, fallback_sw),
         "criteria": fallback_criteria,
-        "total_awarded": int(fallback_marks_sum),
-        "overall_rating": _normalize_rating(float(fallback_marks_sum), float(total_marks) if total_marks > 0 else 1.0),
+        "total_awarded": (fallback_total := int(max(0, min(PRECIS_EXCELLENT_CAP, int(fallback_marks_sum))))),
+        "overall_rating": _normalize_rating(float(fallback_total), float(total_marks) if total_marks > 0 else 1.0),
         "reasons_for_low_score": fallback_reasons[:],
         "ideal_precis": {"title": fallback_ideal_title, "text": fallback_ideal_text},
         "overall_remarks": "Fallback grading used after repeated invalid model outputs; scores are conservative.",
     }
-    if not _validate(fallback):
+    ok, _ = _validate(fallback)
+    if not ok:
         fallback["reasons_for_low_score"] = [
             "Coverage is incomplete and several key points from the source are missing.",
             "Expression needs tighter paraphrasing and clearer organization.",
@@ -2084,6 +2143,9 @@ def render_precis_report_pdf(
     question_statement_text: str = "",
     question_image_path: str = "",
     max_pages: int = 2,
+    language_total: Optional[int] = None,
+    language_spelling_count: Optional[int] = None,
+    language_grammar_count: Optional[int] = None,
 ) -> None:
     """Render report on exactly one page by shrinking all text sizes if needed."""
     palette = _dominant_colors_from_scheme(colouring_scheme_image)
@@ -2100,6 +2162,10 @@ def render_precis_report_pdf(
         ),
         ("Total Marks", f"{total_awarded}/{total_marks}"),
     ]
+    if language_total is not None:
+        sc = language_spelling_count if language_spelling_count is not None else 0
+        gc = language_grammar_count if language_grammar_count is not None else 0
+        fields.append(("Language", f"{language_total} alerts ({sc} spelling, {gc} grammar)"))
 
     criteria = grading.get("criteria") or []
     reasons = grading.get("reasons_for_low_score") or []
@@ -2111,19 +2177,30 @@ def render_precis_report_pdf(
 
     def _sizes(shrink: int) -> Dict[str, float]:
         base = max(6.0, REPORT_BASE_TEXT_SIZE - float(shrink))
+        table_header = max(6.0, base - 0.5)
+        table_cell = max(6.0, base - 1.0)
         return {
             "title": base,
             "field_label": base,
             "field_value": base,
-            "table_header": base,
-            "table_cell": base,
+            "table_header": table_header,
+            "table_cell": table_cell,
             "section": base,
             "bullet": base,
             "ideal_title": base,
         }
 
+    REPORT_PAGE_BORDER_WIDTH = 1.0
+
     def _render_once(doc: fitz.Document, shrink: int) -> bool:
         page = doc.new_page(width=W, height=H)
+        # Full frame so content stays inside; consistent with margin.
+        page.draw_rect(
+            fitz.Rect(margin, margin, W - margin, H - margin),
+            color=palette["border"],
+            fill=None,
+            width=REPORT_PAGE_BORDER_WIDTH,
+        )
         s = _sizes(shrink)
         y = margin
         usable_h = H - margin
@@ -2160,11 +2237,11 @@ def render_precis_report_pdf(
 
         y += 4
 
-        # Table
+        # Table (compact: smaller fonts, reduced row/header height, truncated text)
         headers = ["Criterion", "Marks Allocated", "Marks Awarded", "Key Comments"]
         col_w = [205.0, 78.0, 78.0, W - (margin * 2 + 205.0 + 78.0 + 78.0)]
         header_max_lines = max(len(_wrap_lines(h, "hebo", s["table_header"], col_w[i] - 6)) for i, h in enumerate(headers))
-        header_h = max(16.0, header_max_lines * (s["table_header"] * 1.05) + 6)
+        header_h = max(12.0, header_max_lines * (s["table_header"] * 1.02) + 4)
         if not _need(header_h + 2):
             return False
         x = margin
@@ -2181,16 +2258,20 @@ def render_precis_report_pdf(
                 page.draw_line((x, y), (x, y + header_h), color=palette["border"], width=1)
         y += header_h
 
+        table_crit_max_chars = 120
+        table_comment_max_chars = 180
+        table_crit_max_lines = 2
+        table_comment_max_lines = 3
         for idx, c in enumerate(criteria):
-            crit = str(c.get("criterion", ""))
+            crit = (str(c.get("criterion", "")) or "")[:table_crit_max_chars]
             alloc = str(c.get("marks_allocated", ""))
             award = str(c.get("marks_awarded", ""))
-            comment = str(c.get("key_comments", ""))
+            comment = (str(c.get("key_comments", "")) or "")[:table_comment_max_chars]
 
-            crit_lines = _wrap_lines(crit, "helv", s["table_cell"], col_w[0] - 6)
-            cmt_lines = _wrap_lines(comment, "helv", s["table_cell"], col_w[3] - 6)
-            line_h = s["table_cell"] * 1.2
-            row_h = max(18.0, max(len(crit_lines), len(cmt_lines), 1) * line_h + 6)
+            crit_lines = _wrap_lines(crit, "helv", s["table_cell"], col_w[0] - 6)[:table_crit_max_lines]
+            cmt_lines = _wrap_lines(comment, "helv", s["table_cell"], col_w[3] - 6)[:table_comment_max_lines]
+            line_h = s["table_cell"] * 1.12
+            row_h = max(12.0, max(len(crit_lines), len(cmt_lines), 1) * line_h + 4)
             if not _need(row_h + 1):
                 return False
 
@@ -2268,42 +2349,21 @@ def render_precis_report_pdf(
         return True
 
     def _render_question_page(doc: fitz.Document) -> None:
+        # Student-facing PDF: show only "Question" heading + image. Do not render extracted
+        # question/passage text here; it remains in JSON/debug only.
         page = doc.new_page(width=W, height=H)
+        # Same border frame as report page for consistency.
+        page.draw_rect(
+            fitz.Rect(margin, margin, W - margin, H - margin),
+            color=palette["border"],
+            fill=None,
+            width=REPORT_PAGE_BORDER_WIDTH,
+        )
         y = margin
-        label_size = REPORT_BASE_TEXT_SIZE
-        body_size = max(8.0, REPORT_BASE_TEXT_SIZE - 2)
+        label_size = REPORT_BASE_TEXT_SIZE + 1.0  # Slightly larger for prominent section title
 
-        if question_text:
-            page.insert_text((margin, y + label_size), "Question:", fontname="hebo", fontsize=label_size, color=palette["section_title"])
-            y += label_size + 4
-            y = _draw_wrapped_text(
-                page,
-                margin,
-                y + body_size,
-                question_text,
-                fontname="helv",
-                fontsize=body_size,
-                max_width=W - 2 * margin,
-                color=(0, 0, 0),
-                line_gap=1.25,
-            )
-            y += 8
-
-        if question_statement_text:
-            page.insert_text((margin, y + label_size), "Passage:", fontname="hebo", fontsize=label_size, color=palette["section_title"])
-            y += label_size + 4
-            y = _draw_wrapped_text(
-                page,
-                margin,
-                y + body_size,
-                question_statement_text,
-                fontname="helv",
-                fontsize=body_size,
-                max_width=W - 2 * margin,
-                color=(0, 0, 0),
-                line_gap=1.25,
-            )
-            y += 8
+        page.insert_text((margin, y + label_size), "Question", fontname="hebo", fontsize=label_size, color=palette["section_title"])
+        y += label_size + 12
 
         if question_image_path and os.path.exists(question_image_path):
             try:
@@ -2392,11 +2452,13 @@ def run_precis_grading(
 
     # Spelling/grammar detection (optional); normalize and save debug
     raw_spelling_errors: List[Dict[str, Any]] = []
+    spelling_pipeline_error: Optional[str] = None
     if enable_spelling_annotations and run_spelling_detection is not None:
         try:
             payload = run_spelling_detection(grok_key, ocr_data)
             raw_spelling_errors = payload.get("errors", []) or []
         except Exception as e:
+            spelling_pipeline_error = str(e)
             print(f"Warning: spelling detection failed: {e}")
             raw_spelling_errors = []
     else:
@@ -2407,17 +2469,24 @@ def run_precis_grading(
     num_ocr_pages = len(ocr_data.get("pages", []))
     normalized_spelling_errors = normalize_spelling_errors(raw_spelling_errors, num_ocr_pages)
     pages_affected = sorted({e["page"] for e in normalized_spelling_errors})
+    spelling_count = sum(1 for e in normalized_spelling_errors if e.get("normalized_category") == "spelling")
+    grammar_count = sum(1 for e in normalized_spelling_errors if e.get("normalized_category") == "grammar")
     print(f"Spelling: raw_errors={len(raw_spelling_errors)}, normalized={len(normalized_spelling_errors)}, pages_affected={pages_affected}")
     debug_llm_dir = os.path.join(os.path.dirname(output_json_path) or ".", "debug_llm")
     os.makedirs(debug_llm_dir, exist_ok=True)
     spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
+    debug_payload: Dict[str, Any] = {
+        "raw_count": len(raw_spelling_errors),
+        "normalized_count": len(normalized_spelling_errors),
+        "spelling_count": spelling_count,
+        "grammar_count": grammar_count,
+        "errors": normalized_spelling_errors,
+        "meta": {"total_pages": num_ocr_pages, "pages_affected": pages_affected},
+    }
+    if spelling_pipeline_error is not None:
+        debug_payload["pipeline_error"] = spelling_pipeline_error
     with open(spelling_debug_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "raw_count": len(raw_spelling_errors),
-            "normalized_count": len(normalized_spelling_errors),
-            "errors": normalized_spelling_errors,
-            "meta": {"total_pages": num_ocr_pages, "pages_affected": pages_affected},
-        }, f, indent=2, ensure_ascii=False)
+        json.dump(debug_payload, f, indent=2, ensure_ascii=False)
     print(f"Spelling debug saved -> {spelling_debug_path}")
 
     print("Preparing page images for Grok...")
@@ -2481,20 +2550,18 @@ def run_precis_grading(
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"Saved JSON -> {output_json_path}")
 
-    question_block_text, question_statement_block_text = _extract_question_blocks(ocr_data)
+    question_block_text, question_statement_block_text, question_extract_debug = _extract_question_blocks(ocr_data)
     question_json_path = os.path.join(os.path.dirname(output_json_path) or ".", "question_extracted.json")
     with open(question_json_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "question_text": grading.get("question_text", ""),
-                "question_statement_text": grading.get("question_statement_text", ""),
-                "question_block_text": question_block_text,
-                "question_statement_block_text": question_statement_block_text,
-            },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
+        payload: Dict[str, Any] = {
+            "question_text": grading.get("question_text", ""),
+            "question_statement_text": grading.get("question_statement_text", ""),
+            "question_block_text": question_block_text,
+            "question_statement_block_text": question_statement_block_text,
+        }
+        if isinstance(question_extract_debug, dict):
+            payload["debug"] = question_extract_debug
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"Saved Question JSON -> {question_json_path}")
 
     answer_title_hint, answer_block_text = _extract_answer_block_text(ocr_data)
@@ -2537,6 +2604,7 @@ def run_precis_grading(
             question_image_path = str(p.get("file_path"))
             break
     has_question_page = bool(question_text or question_statement_text or question_image_path)
+    language_total = len(normalized_spelling_errors)
     render_precis_report_pdf(
         grading,
         report_tmp,
@@ -2545,6 +2613,9 @@ def run_precis_grading(
         question_statement_text=question_statement_text,
         question_image_path=question_image_path,
         max_pages=1,
+        language_total=language_total,
+        language_spelling_count=spelling_count,
+        language_grammar_count=grammar_count,
     )
     timings["PDF render"] = time.perf_counter() - t0
     print(f"PDF render done in {_format_duration(timings['PDF render'])}")
@@ -2554,6 +2625,7 @@ def run_precis_grading(
     if annotate_pdf_essay_pages is None:
         raise RuntimeError("annotate_pdf_with_precis.py is required for annotation rendering.")
 
+    annotation_debug_path = os.path.join(debug_llm_dir, "annotations_debug.json")
     annotated_pages = annotate_pdf_essay_pages(
         pdf_path=pdf_path,
         ocr_data=ocr_data,
@@ -2564,6 +2636,7 @@ def run_precis_grading(
         spelling_errors=normalized_spelling_errors,
         max_callouts_per_page=8,
         dpi=annotated_page_dpi,
+        annotation_debug_path=annotation_debug_path,
     )
     if has_question_page and len(annotated_pages) >= 2:
         # Drop the annotated question page to avoid duplicating the report's question page.
@@ -2595,21 +2668,33 @@ def run_precis_grading(
         _rdoc.close()
     first_answer_page_1based = 2 if has_question_page else 1
     merge_report_and_annotated_answer(report_tmp, annotated_pages, output_pdf_path)
+    placement_results: Optional[List[Dict[str, Any]]] = None
+    placement_error: Optional[str] = None
     if normalized_spelling_errors and enable_spelling_annotations and add_spelling_annotations_to_merged_pdf is not None and page_transforms:
-        placement_results = add_spelling_annotations_to_merged_pdf(
-            output_pdf_path,
-            ocr_data,
-            normalized_spelling_errors,
-            num_report_pages,
-            first_answer_page_1based,
-            page_transforms,
-        )
+        try:
+            placement_results = add_spelling_annotations_to_merged_pdf(
+                output_pdf_path,
+                ocr_data,
+                normalized_spelling_errors,
+                num_report_pages,
+                first_answer_page_1based,
+                page_transforms,
+            )
+        except Exception as e:
+            placement_error = str(e)
+            placement_results = None
         spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
-        if placement_results and os.path.exists(spelling_debug_path):
+        if os.path.exists(spelling_debug_path):
             try:
                 with open(spelling_debug_path, "r", encoding="utf-8") as f:
                     debug_data = json.load(f)
-                debug_data["placement"] = placement_results
+                if placement_results is not None:
+                    debug_data["placement"] = placement_results
+                    placement_failed_count = sum(1 for p in placement_results if p.get("status") == "not_found")
+                    debug_data["placement_failed_count"] = placement_failed_count
+                    debug_data["inline_rendered_count"] = len(placement_results) - placement_failed_count
+                if placement_error is not None:
+                    debug_data["placement_error"] = placement_error
                 with open(spelling_debug_path, "w", encoding="utf-8") as f:
                     json.dump(debug_data, f, indent=2, ensure_ascii=False)
             except Exception:

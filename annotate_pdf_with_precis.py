@@ -22,6 +22,8 @@ IMPORTANT (upstream requirement):
 """
 
 import io
+import json
+import os
 import re
 import difflib
 import unicodedata
@@ -35,7 +37,8 @@ import cv2
 
 # Right-side annotation layout: set True to print box geometry and overflow flags
 DEBUG_RIGHT_BOX_LAYOUT = False
-RIGHT_BOX_MIN_GAP = 8  # minimum vertical gap between right-side boxes (px)
+RIGHT_BOX_MIN_GAP = 10  # minimum vertical gap between right-side boxes (px)
+RIGHT_BOX_MIN_HEIGHT = 60  # minimum box height when shrinking for dense pages (px)
 
 # Spelling annotation placement: set True to print box/connector geometry per error
 DEBUG_SPELL_DRAW = True
@@ -70,6 +73,17 @@ def _keywords_only(s: str, max_words: int = 7) -> str:
     toks = _tokenize_full(s)
     toks = [t for t in toks if t not in STOP]
     return " ".join(toks[:max_words])
+
+def _normalize_compact(text: str) -> str:
+    """Normalized compact form for page text / candidate comparison."""
+    return " ".join(_tokenize_full(text))
+
+def _normalize_aggressive(text: str) -> str:
+    """Aggressive normalization for fuzzy OCR: collapse whitespace then tokenize and join."""
+    if not text:
+        return ""
+    s = re.sub(r"\s+", " ", (text or "").strip()).strip()
+    return _normalize_compact(s)
 
 def _token_coverage(target: str, candidate: str) -> float:
     t_tokens = _tokenize_full(target)
@@ -551,6 +565,168 @@ def _find_best_match_rect_from_ocr(
     return final
 
 
+def _find_exact_rect_in_pdf_text(
+    page: fitz.Page,
+    pix_w: int,
+    pix_h: int,
+    target_text: str,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Exact token sequence match in PDF text (strict, prevents mismatches)."""
+    tgt_tokens = _tokenize_full(target_text)
+    if not tgt_tokens:
+        return None
+
+    words = _extract_pdf_words(page)
+    if not words:
+        return None
+
+    tokens: List[Tuple[str, Tuple[float, float, float, float]]] = []
+    for w in words:
+        for tok in _tokenize_full(w["text"]):
+            tokens.append((tok, w["rect"]))
+
+    if len(tokens) < len(tgt_tokens):
+        return None
+
+    N = len(tgt_tokens)
+    for i in range(0, len(tokens) - N + 1):
+        window_tokens = [t for t, _ in tokens[i:i + N]]
+        if window_tokens == tgt_tokens:
+            rect = None
+            for _, r in tokens[i:i + N]:
+                rect = _union_rects(rect, r)
+            if not rect:
+                return None
+            rect_px = _pdf_rects_to_pix_rect(rect, page, pix_w, pix_h)
+            x1, y1, x2, y2 = rect_px
+            pad = 4
+            return (max(0, x1 - pad), max(0, y1 - pad), min(pix_w - 1, x2 + pad), min(pix_h - 1, y2 + pad))
+    return None
+
+
+def _find_exact_rect_from_ocr(
+    page_ocr: Dict[str, Any],
+    target_text: str,
+    pix_w: int,
+    pix_h: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Exact normalized substring match in OCR lines."""
+    if not page_ocr:
+        return None
+    extent = _compute_page_extent(page_ocr)
+    if not extent:
+        return None
+    lines = page_ocr.get("lines") or []
+    if not lines:
+        return None
+
+    tgt_norm = _normalize_compact(target_text)
+    if not tgt_norm:
+        return None
+
+    tgt_tokens = _tokenize_full(target_text)
+    tgt_first_3 = " ".join(tgt_tokens[:3]) if len(tgt_tokens) >= 3 else tgt_norm
+    tgt_first_5 = " ".join(tgt_tokens[:5]) if len(tgt_tokens) >= 5 else tgt_norm
+
+    for win in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        for i in range(0, len(lines) - win + 1):
+            combined_text, rect_raw = _best_window_match(lines, i, win)
+            if not combined_text or not rect_raw:
+                continue
+            combined_norm = _normalize_compact(combined_text)
+
+            if tgt_norm in combined_norm:
+                return _scale_rect_by_extent(rect_raw, extent, pix_w, pix_h)
+            if len(tgt_tokens) >= 5 and tgt_first_5 in combined_norm:
+                return _scale_rect_by_extent(rect_raw, extent, pix_w, pix_h)
+            if len(tgt_tokens) >= 3 and tgt_first_3 in combined_norm:
+                return _scale_rect_by_extent(rect_raw, extent, pix_w, pix_h)
+
+    # Lenient: token presence threshold for poor OCR
+    best_match_count = 0
+    best_match_rect_raw = None
+    if len(tgt_tokens) >= 2:
+        for win in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+            for i in range(0, len(lines) - win + 1):
+                combined_text, rect_raw = _best_window_match(lines, i, win)
+                if not combined_text or not rect_raw:
+                    continue
+                combined_tokens = _tokenize_full(combined_text)
+                matches = sum(1 for t in tgt_tokens if t in combined_tokens)
+                if matches > best_match_count:
+                    best_match_count = matches
+                    best_match_rect_raw = rect_raw
+                if matches >= max(2, int(len(tgt_tokens) * 0.20)):
+                    return _scale_rect_by_extent(rect_raw, extent, pix_w, pix_h)
+
+    if best_match_count >= max(3, int(len(tgt_tokens) * 0.15)) and best_match_rect_raw:
+        return _scale_rect_by_extent(best_match_rect_raw, extent, pix_w, pix_h)
+
+    return None
+
+
+def _find_fuzzy_rect_from_ocr(
+    page_ocr: Dict[str, Any],
+    target_text: str,
+    pix_w: int,
+    pix_h: int,
+    *,
+    min_score: float = 0.50,
+    min_coverage: float = 0.40,
+    max_window: int = 12,
+    max_start_positions: int = 80,
+) -> Optional[Tuple[Tuple[int, int, int, int], str]]:
+    """
+    Fuzzy OCR fallback: token overlap + similarity score. Only use when exact PDF/OCR fail.
+    Returns (rect_px, matched_snippet) or None. Caller dedupes rects.
+    """
+    tgt_norm = _normalize_aggressive(target_text)
+    if not tgt_norm:
+        return None
+    extent = _compute_page_extent(page_ocr)
+    if not extent or not page_ocr:
+        return None
+    lines = page_ocr.get("lines") or []
+    if not lines:
+        return None
+
+    win_max = min(max_window, len(lines))
+
+    best_score = 0.0
+    best_rect_raw = None
+    best_snippet = ""
+
+    for w in range(1, win_max + 1):
+        for i in range(0, min(len(lines) - w + 1, max_start_positions)):
+            combined_text, rect_raw = _best_window_match(lines, i, w)
+            if not combined_text or not rect_raw:
+                continue
+            score = _line_match_score(target_text, combined_text)
+            cov = _token_coverage(target_text, combined_text)
+            if score < min_score or cov < min_coverage:
+                continue
+            if score > best_score:
+                best_score = score
+                best_rect_raw = rect_raw
+                best_snippet = combined_text
+
+    if not best_rect_raw:
+        return None
+
+    rect_px = _scale_rect_by_extent(best_rect_raw, extent, pix_w, pix_h)
+    x1, y1, x2, y2 = rect_px
+    pad = 5
+    final = (
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(pix_w - 1, x2 + pad),
+        min(pix_h - 1, y2 + pad),
+    )
+    if final[2] <= final[0] or final[3] <= final[1]:
+        return None
+    return (final, best_snippet)
+
+
 # ============================================================
 # ANNOTATION TARGETS (NEW: OCR-ANCHOR FIRST)
 # ============================================================
@@ -617,6 +793,79 @@ def _build_annotation_candidates(a: Dict[str, Any]) -> List[Tuple[str, bool]]:
     return final
 
 
+def _build_precis_annotation_candidates_for_page_search(a: Dict[str, Any]) -> List[str]:
+    """
+    Flat list of candidate strings for page-resolution search.
+    Same field priorities as _build_annotation_candidates; at least 2 tokens per candidate.
+    """
+    paired = _build_annotation_candidates(a)
+    out: List[str] = []
+    for txt, _ in paired:
+        if not txt:
+            continue
+        k = _normalize_compact(txt)
+        if not k or k in {_normalize_compact(x) for x in out}:
+            continue
+        if len(k.split()) < 2:
+            continue
+        out.append(txt)
+    return out
+
+
+def _build_language_annotation_candidates(a: Dict[str, Any]) -> List[str]:
+    """
+    Word/phrase-first candidate list for grammar/language annotations.
+    Includes single-token candidates; dedupes by normalized form; max 20 entries.
+    """
+    out: List[str] = []
+    seen: set = set()
+    max_entries = 20
+
+    def add(s: str) -> None:
+        nonlocal out, seen
+        s = (s or "").strip()
+        if not s or len(out) >= max_entries:
+            return
+        k = _normalize_compact(s)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(s)
+
+    target = (a.get("target_word_or_sentence") or "").strip()
+    if target:
+        for word in target.split():
+            add(word)
+        add(target)
+    add((a.get("original_text") or "").strip())
+    add((a.get("error_span") or "").strip())
+    add((a.get("incorrect_word") or "").strip())
+    anchor_quote = (a.get("anchor_quote") or a.get("anchorQuote") or "").strip()
+    if anchor_quote:
+        add(anchor_quote)
+        for word in anchor_quote.split()[:5]:
+            add(word)
+    cb = (a.get("context_before") or "").strip()
+    ca = (a.get("context_after") or "").strip()
+    if target and cb:
+        add((cb + " " + target).strip())
+    if target and ca:
+        add((target + " " + ca).strip())
+    if target and cb and ca:
+        add((cb + " " + target + " " + ca).strip())
+    return out[:max_entries]
+
+
+def _find_pages_for_candidate(
+    cand: str,
+    page_text_norm_by_num: Dict[int, str],
+) -> List[int]:
+    """Return page numbers where normalized page text contains the candidate."""
+    cand_norm = _normalize_compact(cand)
+    if not cand_norm:
+        return []
+    return [pn for pn, ptxt in page_text_norm_by_num.items() if cand_norm in ptxt]
+
+
 # ============================================================
 # DEDUP / ASSIGNMENT HELPERS
 # ============================================================
@@ -636,6 +885,33 @@ def _rect_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> flo
 def _shift_rect(rect: Tuple[int, int, int, int], x_shift: int, y_shift: int) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = rect
     return (x1 + x_shift, y1 + y_shift, x2 + x_shift, y2 + y_shift)
+
+
+def _clip_rect(rect: Tuple[int, int, int, int], max_w: int, max_h: int) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = rect
+    x1 = max(0, min(x1, max_w - 1))
+    y1 = max(0, min(y1, max_h - 1))
+    x2 = max(0, min(x2, max_w - 1))
+    y2 = max(0, min(y2, max_h - 1))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return (x1, y1, x2, y2)
+
+
+def _draw_pointer_line(
+    img: np.ndarray,
+    annotation_box: Tuple[int, int, int, int],
+    target_rect: Tuple[int, int, int, int],
+    color: Tuple[int, int, int] = (0, 0, 255),
+    thickness: int = 2,
+) -> None:
+    ax1, ay1, ax2, ay2 = annotation_box
+    tx1, ty1, tx2, ty2 = target_rect
+    start = (ax1, (ay1 + ay2) // 2)
+    end = (tx2, (ty1 + ty2) // 2)
+    cv2.line(img, start, end, color, thickness, cv2.LINE_AA)
 
 
 # ============================================================
@@ -1420,6 +1696,7 @@ def annotate_pdf_essay_pages(
     dedup_iou_threshold: float = 0.35,
     topk_candidates_per_ann: int = 6,
     max_callouts_per_page: int = 12,
+    annotation_debug_path: Optional[str] = None,
 ) -> List[Image.Image]:
     """
     Returns list of annotated PIL images (one per page).
@@ -1435,6 +1712,7 @@ def annotate_pdf_essay_pages(
     page_suggestions = page_suggestions or []
     spelling_errors = spelling_errors or []
     doc = fitz.open(pdf_path)
+    collect_debug = bool(annotation_debug_path)
 
     # Render pages
     pil_pages: List[Image.Image] = []
@@ -1453,6 +1731,46 @@ def annotate_pdf_essay_pages(
             pn = int(pn.strip())
         if isinstance(pn, int):
             ocr_pages_by_num[pn] = p
+
+    # Build normalized page text per page for resolution
+    page_text_norm_by_num: Dict[int, str] = {}
+    for pn, p in ocr_pages_by_num.items():
+        text = (p.get("ocr_page_text") or p.get("ocr_full_text_page") or "").strip()
+        if not text:
+            lines = p.get("lines") or []
+            text = " ".join(_line_text(ln) for ln in lines if _line_text(ln))
+        page_text_norm_by_num[pn] = _normalize_compact(text)
+
+    # Resolve annotations to the correct page
+    resolved_annotations: List[Dict[str, Any]] = []
+    for a in annotations:
+        orig_page = a.get("page")
+        resolved_page = orig_page if isinstance(orig_page, int) else None
+        resolved_candidate = ""
+        resolved = False
+
+        for cand in _build_precis_annotation_candidates_for_page_search(a):
+            pages = _find_pages_for_candidate(cand, page_text_norm_by_num)
+            if not pages:
+                continue
+            if isinstance(orig_page, int) and orig_page in pages:
+                resolved_page = orig_page
+                resolved_candidate = cand
+                resolved = True
+                break
+            if len(pages) == 1:
+                resolved_page = pages[0]
+                resolved_candidate = cand
+                resolved = True
+                break
+
+        ann2 = dict(a)
+        if resolved_page is not None:
+            ann2["_resolved_page"] = resolved_page
+        if resolved_candidate:
+            ann2["_resolved_candidate"] = resolved_candidate
+        ann2["_resolved_match"] = resolved
+        resolved_annotations.append(ann2)
 
     # Suggestions per page
     suggestions_by_page: Dict[int, List[str]] = {}
@@ -1591,15 +1909,16 @@ def annotate_pdf_essay_pages(
         # NOTE: Spelling/grammar errors are added using PyMuPDF after PIL images are created
         # See _add_spelling_annotations_to_pdf_pages() function called at the end
 
-        # Build callouts for this page
-        anns = [a for a in annotations if a.get("page") == page_number][:max_callouts_per_page]
+        # Build callouts for this page (use resolved page)
+        anns = [
+            a for a in resolved_annotations
+            if a.get("_resolved_page", a.get("page")) == page_number
+        ][:max_callouts_per_page]
         print(f"  Annotations for this page: {len(anns)}")
 
         callout_items: List[Dict[str, Any]] = []
 
         for idx, a in enumerate(anns):
-            # Matching/anchors disabled: skip detailed processing
-            continue
             a_type = (a.get("type") or "").strip()
             rubric_point = (a.get("rubric_point") or "").strip()
             comment = (a.get("comment") or "").strip()
@@ -1609,43 +1928,77 @@ def annotate_pdf_essay_pages(
             header = f"[{a_type}] {rubric_point}".strip()
             body = (comment + (f"  Fix: {correction}" if correction else "")).strip()
             if a_type != "grammar_language" and correction:
-                body = (comment + ("  Suggestion: " + correction)).strip()
+                body = (comment).strip()
 
-            candidates = _build_annotation_candidates(a)
-            
-            # DEBUG: Show what we're trying to match
-            if not anchor_quote:
-                first_cand = candidates[0][0] if candidates else ""
-                print(f"    [{idx+1}] ❌ has_anchor=False | first_candidate={first_cand[:60]}")
+            resolved_candidate = (a.get("_resolved_candidate") or "").strip()
+            base_candidates = [resolved_candidate] if resolved_candidate else _build_precis_annotation_candidates_for_page_search(a)
+            if (a_type or "").strip().lower() == "grammar_language":
+                language_first = _build_language_annotation_candidates(a)
+                lang_set = set(language_first)
+                candidates = language_first + [c for c in base_candidates if c not in lang_set]
             else:
-                print(f"    [{idx+1}] ✓ has_anchor=True | anchor_quote={anchor_quote[:60]}")
+                candidates = base_candidates
 
+            # Filter blank; when anchor_quote exists but list is empty (e.g. single-word dropped by page-search), use full candidate builder
+            candidates = [c for c in candidates if (c or "").strip()]
+            if not candidates and anchor_quote:
+                fallback = [txt for txt, _ in _build_annotation_candidates(a) if (txt or "").strip()]
+                if fallback:
+                    candidates = fallback
+
+            match_status = "none"
             match_candidates: List[Tuple[float, Tuple[int, int, int, int]]] = []
 
-            # attempt matching with best-first candidates
-            for cand_text, is_anchor in candidates:
-                # 1) PDF text match (best for digital PDFs)
-                rect_pdf = _find_match_rect_in_pdf_text(page_obj, orig_w, orig_h, cand_text)
-                if rect_pdf:
-                    match_candidates.append((0.95 if is_anchor else 0.90, rect_pdf))
-                    # PDF text hit is strong enough; don't waste time
+            for cand_text in candidates:
+                if not cand_text:
                     continue
+                rect_pdf = _find_exact_rect_in_pdf_text(page_obj, orig_w, orig_h, cand_text)
+                if rect_pdf:
+                    n_tok = len(_tokenize_full(cand_text))
+                    if n_tok == 1:
+                        match_status = "word_exact"
+                    elif 2 <= n_tok <= 5:
+                        match_status = "phrase_exact"
+                    else:
+                        match_status = "pdf_exact"
+                    if collect_debug:
+                        a["_matched_snippet"] = (cand_text or "")[:200]
+                        a["_match_confidence"] = 0.95
+                    match_candidates.append((0.95, rect_pdf))
+                    break
 
-                # 2) OCR match
-                if page_ocr:
-                    rect_ocr = _find_best_match_rect_from_ocr(
-                        page_ocr,
-                        cand_text,
-                        orig_w,
-                        orig_h,
-                        prefer_anchor=is_anchor,
-                    )
+            if not match_candidates and page_ocr:
+                for cand_text in candidates:
+                    if not cand_text:
+                        continue
+                    rect_ocr = _find_exact_rect_from_ocr(page_ocr, cand_text, orig_w, orig_h)
                     if rect_ocr:
-                        # anchors get higher base confidence
-                        match_candidates.append((0.80 if is_anchor else 0.65, rect_ocr))
+                        n_tok = len(_tokenize_full(cand_text))
+                        if n_tok == 1:
+                            match_status = "word_exact"
+                        elif 2 <= n_tok <= 5:
+                            match_status = "phrase_exact"
+                        else:
+                            match_status = "ocr_exact"
+                        if collect_debug:
+                            a["_matched_snippet"] = (cand_text or "")[:200]
+                            a["_match_confidence"] = 0.90
+                        match_candidates.append((0.90, rect_ocr))
+                        break
 
-            # keep top-K unique rects
-            match_candidates.sort(key=lambda x: x[0], reverse=True)
+            if not match_candidates and page_ocr:
+                for cand_text in candidates:
+                    if not cand_text:
+                        continue
+                    fuzzy_result = _find_fuzzy_rect_from_ocr(page_ocr, cand_text, orig_w, orig_h)
+                    if fuzzy_result is not None:
+                        rect_fuzzy, matched_snippet = fuzzy_result
+                        match_status = "ocr_fuzzy"
+                        if collect_debug:
+                            a["_matched_snippet"] = (matched_snippet or cand_text or "")[:200]
+                            a["_match_confidence"] = 0.70
+                        match_candidates.append((0.70, rect_fuzzy))
+                        break
 
             uniq: List[Tuple[float, Tuple[int, int, int, int]]] = []
             for sc, rr in match_candidates:
@@ -1657,13 +2010,17 @@ def annotate_pdf_essay_pages(
                 if len(uniq) >= topk_candidates_per_ann:
                     break
 
+            a["_match_status"] = match_status
+            if collect_debug:
+                a["_debug_candidates"] = [(c or "")[:100] for c in candidates[:20]]
             callout_items.append({
                 "ann": a,
                 "header": header,
                 "body": body,
                 "cands": uniq,
-                "has_anchor": any(is_anchor for _, is_anchor in candidates),
-                "primary_candidate_preview": candidates[0][0] if candidates else "",
+                "has_anchor": bool(anchor_quote),
+                "primary_candidate_preview": candidates[0] if candidates else "",
+                "_match_status": match_status,
             })
 
         # GLOBAL ASSIGNMENT + page-level fallback
@@ -1700,6 +2057,8 @@ def annotate_pdf_essay_pages(
             if is_page_level:
                 header2 = header2 + " (page-level)"
 
+            if collect_debug:
+                item["ann"]["_debug_rect"] = list(final_rect) if final_rect else None
             resolved_callouts.append({
                 "rect": final_rect,
                 "header": header2,
@@ -1707,47 +2066,32 @@ def annotate_pdf_essay_pages(
                 "y_sort": final_rect[1] if final_rect else 10**9,
                 "score": chosen_score,
                 "page_level": is_page_level,
+                "_match_status": item.get("_match_status", "none"),
             })
 
             if is_page_level and debug_print_fail_samples and failed_examples < 3:
                 failed_examples += 1
                 print("  ❌ Unmatched annotation sample:")
                 print(f"     has_anchor={item['has_anchor']}")
-                print(f"     candidate_preview={item['primary_candidate_preview'][:120]}")
+                print(f"     candidate_preview={(item.get('primary_candidate_preview') or '')[:120]}")
 
-        # RIGHT MARGIN LAYOUT — two-pass: compute geometry then draw (no overlap, text inside box).
+        # RIGHT MARGIN LAYOUT — sort by target y (matched first, then page-level), then fit and place with min gap.
         box_w = int(right_width - 2 * margin_px)
-        gap = 12
+        gap = RIGHT_BOX_MIN_GAP
         max_bottom = orig_h - margin_px
         avail_h = max(1, max_bottom - margin_px)
-        l_gap = 20
+        n_callouts = len(resolved_callouts)
+        l_gap = 16 if n_callouts > 4 else 20  # tighter line gap on dense pages
 
-        # Pass 1: build resolved_callouts (header, body, y_sort).
-        resolved_callouts = []
-        for idx, a in enumerate(anns):
-            a_type = (a.get("type") or "").strip()
-            rubric_point = (a.get("rubric_point") or "").strip()
-            comment = (a.get("comment") or "").strip()
-            correction = (a.get("correction") or "").strip()
-            header = f"[{a_type}] {rubric_point}".strip()
-            body = (comment + (f"  Fix: {correction}" if correction else "")).strip()
-            if a_type != "grammar_language" and correction:
-                body = (comment).strip()
-            resolved_callouts.append({
-                "rect": None,
-                "header": header,
-                "body": body,
-                "y_sort": idx,
-                "page_level": True,
-            })
-        resolved_callouts.sort(key=lambda x: x["y_sort"])
+        # Stable order: matched annotations by target y (fewer line crossings), then page-level feedback
+        resolved_callouts.sort(key=lambda x: (x.get("page_level", False), x["y_sort"]))
 
         if not resolved_callouts:
             annotated_pages.append(Image.fromarray(canvas[:, :, ::-1]))
             continue
 
         # Pass 2: fit text per box, then resolve collisions and clamp to page.
-        tentative_max_h = max(80, (avail_h - gap * (len(resolved_callouts) - 1)) // len(resolved_callouts))
+        tentative_max_h = max(RIGHT_BOX_MIN_HEIGHT, (avail_h - gap * (n_callouts - 1)) // max(1, n_callouts))
         fitted: List[Dict[str, Any]] = []
         for item in resolved_callouts:
             header_scale, body_scale, header_lines, body_lines, box_h, overflow_truncated = _fit_right_annotation_box(
@@ -1779,8 +2123,8 @@ def annotate_pdf_essay_pages(
                 by1 = max(margin_px, by2 - f["box_h"])
                 # If clamping causes overlap with previous, shrink this box and re-fit
                 if i > 0 and by1 < fitted[i - 1].get("by2", 0) + min_gap:
-                    shrink_max_h = max(60, (max_bottom - margin_px) - (fitted[i - 1].get("by2", 0) + min_gap))
-                    if shrink_max_h >= 60:
+                    shrink_max_h = max(RIGHT_BOX_MIN_HEIGHT, (max_bottom - margin_px) - (fitted[i - 1].get("by2", 0) + min_gap))
+                    if shrink_max_h >= RIGHT_BOX_MIN_HEIGHT:
                         header_scale2, body_scale2, header_lines2, body_lines2, box_h2, overflow_trunc2 = _fit_right_annotation_box(
                             resolved_callouts[i]["header"],
                             resolved_callouts[i]["body"],
@@ -1822,7 +2166,7 @@ def annotate_pdf_essay_pages(
         for i in range(1, len(fitted)):
             prev_bottom = fitted[i - 1]["by2"]
             if fitted[i]["by1"] < prev_bottom + min_gap:
-                shrink_max_h = max(60, max_bottom - (prev_bottom + min_gap))
+                shrink_max_h = max(RIGHT_BOX_MIN_HEIGHT, max_bottom - (prev_bottom + min_gap))
                 header_scale2, body_scale2, header_lines2, body_lines2, box_h2, overflow_trunc2 = _fit_right_annotation_box(
                     resolved_callouts[i]["header"],
                     resolved_callouts[i]["body"],
@@ -1843,6 +2187,17 @@ def annotate_pdf_essay_pages(
                 by2 = by1 + box_h2  # box_h2 <= shrink_max_h so by2 <= max_bottom
                 fitted[i]["by1"] = by1
                 fitted[i]["by2"] = by2
+
+        # Final clamp: keep all boxes inside page bounds (no box bottom below max_bottom)
+        for i in range(len(fitted)):
+            by1, by2, box_h = fitted[i]["by1"], fitted[i]["by2"], fitted[i]["box_h"]
+            if by2 > max_bottom:
+                by2 = max_bottom
+                by1 = max(margin_px, by2 - box_h)
+                fitted[i]["by1"], fitted[i]["by2"] = by1, by2
+            if fitted[i]["by1"] < margin_px:
+                fitted[i]["by1"] = margin_px
+                fitted[i]["by2"] = min(margin_px + box_h, max_bottom)
 
         if DEBUG_RIGHT_BOX_LAYOUT:
             for i, f in enumerate(fitted):
@@ -1870,7 +2225,51 @@ def annotate_pdf_essay_pages(
                 canvas, bx1 + 12, body_y, f["body_lines"],
                 f["body_scale"], 2, (0, 0, 0), line_gap=l_gap,
             )
+            if item.get("rect") is not None:
+                target_rect = _clip_rect(item["rect"], new_w, orig_h)
+                annotation_box = (bx1, by1, bx2, by2)
+                _draw_pointer_line(canvas, annotation_box, target_rect, color=(0, 0, 255), thickness=2)
 
         annotated_pages.append(Image.fromarray(canvas[:, :, ::-1]))
+
+    if annotation_debug_path and resolved_annotations:
+        try:
+            os.makedirs(os.path.dirname(annotation_debug_path) or ".", exist_ok=True)
+            by_status: Dict[str, int] = {}
+            debug_annotations: List[Dict[str, Any]] = []
+            for i, a in enumerate(resolved_annotations):
+                status = a.get("_match_status", "none")
+                by_status[status] = by_status.get(status, 0) + 1
+                entry: Dict[str, Any] = {
+                    "index": i,
+                    "page": a.get("page"),
+                    "_resolved_page": a.get("_resolved_page"),
+                    "_resolved_candidate": (a.get("_resolved_candidate") or "")[:200],
+                    "_resolved_match": a.get("_resolved_match", False),
+                    "_match_status": status,
+                    "type": (a.get("type") or "").strip()[:80],
+                    "rubric_point": (a.get("rubric_point") or "").strip()[:120],
+                }
+                if a.get("_debug_candidates") is not None:
+                    entry["candidates_tried"] = a["_debug_candidates"]
+                if a.get("_matched_snippet") is not None:
+                    entry["matched_snippet"] = (a.get("_matched_snippet") or "")[:200]
+                if a.get("_match_confidence") is not None:
+                    entry["match_confidence"] = a["_match_confidence"]
+                if a.get("_debug_rect") is not None:
+                    entry["final_rect"] = a["_debug_rect"]
+                debug_annotations.append(entry)
+            payload = {
+                "annotations": debug_annotations,
+                "meta": {
+                    "total": len(resolved_annotations),
+                    "by_match_status": by_status,
+                },
+            }
+            with open(annotation_debug_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print(f"Annotation debug saved -> {annotation_debug_path}")
+        except Exception:
+            pass
 
     return annotated_pages
