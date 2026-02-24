@@ -1568,6 +1568,107 @@ def _add_spelling_annotations_to_pdf(
     pdf_doc.close()
 
 
+def add_spelling_annotations_to_source_pdf(
+    input_pdf_path: str,
+    output_pdf_path: str,
+    ocr_data: Dict[str, Any],
+    spelling_errors: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Add spelling/grammar annotations directly to the source PDF (Essay-style).
+    Call BEFORE annotation rendering so spelling is baked into the output.
+    Returns placement records for debug.
+    """
+    placement_results: List[Dict[str, Any]] = []
+    if not spelling_errors:
+        try:
+            import shutil
+            shutil.copy2(input_pdf_path, output_pdf_path)
+        except Exception:
+            pass
+        return placement_results
+    try:
+        src_doc = fitz.open(input_pdf_path)
+    except Exception:
+        return placement_results
+    pages_data = ocr_data.get("pages", [])
+    page_boxes: Dict[int, List[fitz.Rect]] = {}
+    try:
+        for error in spelling_errors:
+            page_num = int(error.get("page", 1)) - 1
+            if page_num < 0 or page_num >= len(src_doc):
+                continue
+            page = src_doc[page_num]
+            page_info = pages_data[page_num] if page_num < len(pages_data) else {}
+            error_text = error.get("error_text", "")
+            correction = error.get("correction", "")
+            anchor_quote = error.get("anchor_quote")
+            if not error_text or not correction:
+                continue
+            wordrects = _word_rects_in_page_coords_fitz(page_info)
+            anchor_quote_present = anchor_quote is not None and bool((anchor_quote or "").strip())
+            if not wordrects:
+                placement_results.append({
+                    "page": page_num + 1,
+                    "error_text": error_text,
+                    "correction": correction,
+                    "anchor_quote_present": anchor_quote_present,
+                    "anchor_match_used": False,
+                    "match_method": "not_found",
+                    "matched_rect": None,
+                    "box_rect": None,
+                    "status": "not_found",
+                })
+                continue
+            rect, match_method = _find_error_word_span_fitz(wordrects, error_text, anchor_quote)
+            if not rect:
+                placement_results.append({
+                    "page": page_num + 1,
+                    "error_text": error_text,
+                    "correction": correction,
+                    "anchor_quote_present": anchor_quote_present,
+                    "anchor_match_used": False,
+                    "match_method": match_method,
+                    "matched_rect": None,
+                    "box_rect": None,
+                    "status": "not_found",
+                })
+                continue
+            page_w = float(page_info.get("page_width") or page.rect.width)
+            page_h = float(page_info.get("page_height") or page.rect.height)
+            unit = (page_info.get("unit") or "pixel").lower()
+            azure_scale = 72.0 if unit == "inch" else 1.0
+            if page_w > 0 and page_h > 0:
+                sx = page.rect.width / (page_w * azure_scale)
+                sy = page.rect.height / (page_h * azure_scale)
+                rect = rect * fitz.Matrix(sx, sy)
+            page.draw_rect(rect, color=SPELL_COLOR, width=2.0)
+            page_rect = page.rect
+            existing_on_page = page_boxes.get(page_num, [])
+            _wr, box_rect, status = _draw_single_spelling_annotation(
+                page, rect, correction, page_rect, existing_boxes=existing_on_page
+            )
+            if box_rect and not box_rect.is_empty:
+                page_boxes.setdefault(page_num, []).append(box_rect)
+            placement_results.append({
+                "page": page_num + 1,
+                "error_text": error_text,
+                "correction": correction,
+                "anchor_quote_present": anchor_quote_present,
+                "anchor_match_used": (match_method == "anchor_window"),
+                "match_method": match_method,
+                "matched_rect": [rect.x0, rect.y0, rect.x1, rect.y1],
+                "box_rect": [box_rect.x0, box_rect.y0, box_rect.x1, box_rect.y1] if box_rect else None,
+                "status": status,
+            })
+        src_doc.save(output_pdf_path, incremental=False)
+    except Exception:
+        pass
+    finally:
+        src_doc.close()
+    return placement_results
+
+
 def add_spelling_annotations_to_merged_pdf(
     output_pdf_path: str,
     ocr_data: Dict[str, Any],

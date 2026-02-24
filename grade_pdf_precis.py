@@ -4,6 +4,7 @@ import io
 import importlib.util
 import json
 import os
+import random
 import re
 import time
 import zipfile
@@ -23,8 +24,13 @@ from azure.core.exceptions import HttpResponseError
 from dotenv import load_dotenv
 
 add_spelling_annotations_to_merged_pdf = None  # type: Optional[Any]
+add_spelling_annotations_to_source_pdf = None  # type: Optional[Any]
 try:
-    from annotate_pdf_with_precis import annotate_pdf_essay_pages, add_spelling_annotations_to_merged_pdf  # type: ignore
+    from annotate_pdf_with_precis import (
+        annotate_pdf_essay_pages,
+        add_spelling_annotations_to_merged_pdf,
+        add_spelling_annotations_to_source_pdf,
+    )  # type: ignore
 except Exception:
     try:
         parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +42,7 @@ except Exception:
                 spec.loader.exec_module(mod)
                 annotate_pdf_essay_pages = mod.annotate_pdf_essay_pages  # type: ignore
                 add_spelling_annotations_to_merged_pdf = getattr(mod, "add_spelling_annotations_to_merged_pdf", None)  # type: ignore
+                add_spelling_annotations_to_source_pdf = getattr(mod, "add_spelling_annotations_to_source_pdf", None)  # type: ignore
             else:
                 annotate_pdf_essay_pages = None  # type: ignore
         else:
@@ -199,9 +206,11 @@ def parse_json_with_repair(
     max_fix_attempts: int = 2,
     repair_model: str = "grok-4-1-fast-reasoning",
     repair_temperature: float = 0.0,
+    debug_llm_dir: str = "debug_llm",
+    repair_context: Optional[str] = None,
 ) -> Dict[str, Any]:
-    os.makedirs("debug_llm", exist_ok=True)
-    with open(os.path.join("debug_llm", f"{debug_tag}_raw.txt"), "w", encoding="utf-8") as f:
+    os.makedirs(debug_llm_dir, exist_ok=True)
+    with open(os.path.join(debug_llm_dir, f"{debug_tag}_raw.txt"), "w", encoding="utf-8") as f:
         f.write(raw_text or "")
 
     candidate = _extract_json_candidate(raw_text)
@@ -209,11 +218,15 @@ def parse_json_with_repair(
         return json.loads(candidate)
     except Exception as e:
         last_err = e
+        with open(os.path.join(debug_llm_dir, f"{debug_tag}_extracted_candidate.txt"), "w", encoding="utf-8") as f:
+            f.write(candidate or "")
 
     fix_prompt = (
         "Repair the following malformed JSON. Return valid JSON only. "
         "Do not add explanations or markdown."
     )
+    if repair_context:
+        fix_prompt = fix_prompt + " " + repair_context
     current_text = raw_text
     for i in range(max_fix_attempts):
         data = _grok_chat(
@@ -228,7 +241,7 @@ def parse_json_with_repair(
         )
         repaired = data["choices"][0]["message"]["content"]
         repaired_candidate = _extract_json_candidate(repaired)
-        with open(os.path.join("debug_llm", f"{debug_tag}_repaired_attempt{i+1}.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(debug_llm_dir, f"{debug_tag}_repaired_attempt{i+1}.txt"), "w", encoding="utf-8") as f:
             f.write(repaired or "")
         try:
             return json.loads(repaired_candidate)
@@ -809,6 +822,59 @@ def _infer_length_status(original_words: int, required_words: int, student_words
     if student_words < lower:
         return "Too Short"
     return "Too Long"
+
+
+def _adjust_criteria_to_match_total(
+    criteria: List[Dict[str, Any]], target: int, max_iterations: int = 50
+) -> None:
+    """Adjust criteria marks_awarded in place so their sum equals target. Uses random
+    add/subtract of 1-2 per criterion to avoid bias. Respects 0 <= marks_awarded <= marks_allocated."""
+    if not criteria:
+        return
+    current_sum = sum(c.get("marks_awarded", 0) for c in criteria)
+    if current_sum == target:
+        return
+    alloc_sum = sum(int(c.get("marks_allocated", 0) or 0) for c in criteria)
+    target_clamped = max(0, min(target, alloc_sum))
+    if current_sum == target_clamped:
+        return
+    n = len(criteria)
+    for _ in range(max_iterations):
+        current_sum = sum(c.get("marks_awarded", 0) for c in criteria)
+        if current_sum == target_clamped:
+            break
+        delta = current_sum - target_clamped
+        indices = list(range(n))
+        random.shuffle(indices)
+        if delta > 0:
+            step = min(2, delta)
+            for i in indices:
+                if step <= 0:
+                    break
+                c = criteria[i]
+                aw = int(c.get("marks_awarded", 0) or 0)
+                if aw <= 0:
+                    continue
+                take = min(step, aw)
+                c["marks_awarded"] = aw - take
+                step -= take
+        else:
+            step = min(2, -delta)
+            for i in indices:
+                if step <= 0:
+                    break
+                c = criteria[i]
+                aw = int(c.get("marks_awarded", 0) or 0)
+                alloc = int(c.get("marks_allocated", 0) or 0)
+                if aw >= alloc:
+                    continue
+                add = min(step, alloc - aw)
+                c["marks_awarded"] = aw + add
+                step -= add
+    for c in criteria:
+        aw = int(c.get("marks_awarded", 0) or 0)
+        alloc = int(c.get("marks_allocated", 0) or 0)
+        c["rating"] = _normalize_rating(float(aw), float(alloc) if alloc > 0 else 1.0)
 
 
 def _page_extent_from_lines(lines: List[Dict[str, Any]]) -> Tuple[float, float]:
@@ -1501,6 +1567,7 @@ def call_grok_for_precis_grading(
     temperature: float = 0.10,
     repair_model: str = "grok-4-1-fast-reasoning",
     repair_temperature: float = 0.0,
+    debug_llm_dir: str = "debug_llm",
 ) -> Dict[str, Any]:
     def _to_int(value: Any, default: int = 0) -> int:
         try:
@@ -1573,12 +1640,14 @@ def call_grok_for_precis_grading(
         "- Also classify length_status using +/-5% tolerance around required length.\n"
         "Scoring rules:\n"
         "- Follow the provided rubric criteria and marks exactly.\n"
-        "- For each criterion, give marks_awarded as a whole number within [0, marks_allocated].\n"
+        f"- Total marks from criteria = {PRECIS_TOTAL_MARKS} (sum of marks_allocated). Maximum score is capped at {PRECIS_EXCELLENT_CAP}.\n"
+        f"- You MUST assign marks_awarded per criterion so that: sum(marks_awarded) = total_awarded, and total_awarded <= {PRECIS_EXCELLENT_CAP}.\n"
+        f"- total_awarded is NOT independent: it must exactly equal the sum of marks_awarded. Grade criterion-by-criterion, then set total_awarded = that sum (capped at {PRECIS_EXCELLENT_CAP}).\n"
+        f"- For each criterion, give marks_awarded as a whole number within [0, marks_allocated].\n"
+        "- You MUST assign at least one criterion marks_awarded > 0. Never return a grading where all criteria have marks_awarded = 0.\n"
+        "- Each criterion in the criteria array must have marks_awarded as an integer in [0, marks_allocated]. "
+        "A weak precis still receives some marks (e.g. 1) on at least one criterion.\n"
         "- Add concise, evidence-based key_comments for each criterion.\n"
-        "- total_awarded MUST equal the sum of all criteria marks_awarded and MUST NOT exceed "
-        f"{PRECIS_EXCELLENT_CAP}; the maximum possible score is {PRECIS_EXCELLENT_CAP} (cap).\n"
-        "- Provide total_awarded as the sum of marks_awarded values, ensuring the sum is at most "
-        f"{PRECIS_EXCELLENT_CAP}.\n"
         f"- Overall rating 'Excellent' is only allowed when total_awarded is at most {PRECIS_EXCELLENT_CAP}. "
         "If total_awarded exceeds this cap, use 'Good', not 'Excellent'.\n"
         "- Provide overall_rating from: Excellent, Good, Average, Weak (subject to the cap above).\n"
@@ -1663,7 +1732,6 @@ def call_grok_for_precis_grading(
                 }
             )
             marks_sum += aw_int
-        parsed["criteria"] = normalized_criteria
 
         declared_total = parsed.get("total_awarded")
         try:
@@ -1672,11 +1740,16 @@ def call_grok_for_precis_grading(
             declared_total_f = float(marks_sum)
 
         if abs(declared_total_f - marks_sum) > 0.75:
-            parsed["total_awarded"] = int(round(marks_sum))
+            target_total = int(round(marks_sum))
         else:
-            parsed["total_awarded"] = int(round(declared_total_f))
+            target_total = int(round(declared_total_f))
+        target_total = int(max(0, min(PRECIS_EXCELLENT_CAP, target_total)))
 
-        parsed["total_awarded"] = int(max(0, min(PRECIS_EXCELLENT_CAP, int(parsed["total_awarded"]))))
+        if marks_sum != target_total:
+            _adjust_criteria_to_match_total(normalized_criteria, target_total)
+
+        parsed["total_awarded"] = target_total
+        parsed["criteria"] = normalized_criteria
 
         if parsed.get("overall_rating") not in ("Excellent", "Good", "Average", "Weak"):
             parsed["overall_rating"] = _normalize_rating(float(parsed["total_awarded"]), float(total_marks))
@@ -1761,9 +1834,24 @@ def call_grok_for_precis_grading(
                 max_fix_attempts=3,
                 repair_model=repair_model,
                 repair_temperature=repair_temperature,
+                debug_llm_dir=debug_llm_dir,
+                repair_context="Preserve the criteria array; each item must have marks_awarded. Do not remove or zero out criteria.",
             )
         except Exception as e:
             last_err = e
+            err_msg = str(e)[:100]
+            print(f"  Validation failed: JSON parse error - {type(e).__name__}: {err_msg}")
+            debug_path = os.path.join(debug_llm_dir, "precis_grading_debug.json")
+            try:
+                os.makedirs(debug_llm_dir, exist_ok=True)
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "attempt": attempt + 1,
+                        "parse_status": "parse_failed",
+                        "parse_error": str(e),
+                    }, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
             continue
 
         ok, fail_reason = _validate(parsed)
@@ -1774,6 +1862,32 @@ def call_grok_for_precis_grading(
         last_err = ValueError(f"Invalid grading JSON: {fail_reason}")
         if fail_reason:
             print(f"  Validation failed: {fail_reason}")
+        criteria_list = parsed.get("criteria") or []
+        criteria_snapshot = [
+            {
+                "id": c.get("id"),
+                "criterion": c.get("criterion"),
+                "marks_allocated": c.get("marks_allocated"),
+                "marks_awarded": c.get("marks_awarded"),
+            }
+            for c in criteria_list
+        ]
+        debug_path = os.path.join(debug_llm_dir, "precis_grading_debug.json")
+        try:
+            os.makedirs(debug_llm_dir, exist_ok=True)
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "attempt": attempt + 1,
+                    "validation_fail_reason": fail_reason,
+                    "parse_status": "ok",
+                    "criteria_snapshot": criteria_snapshot,
+                    "criteria_count": len(criteria_list),
+                    "total_awarded": parsed.get("total_awarded"),
+                    "has_ideal_precis_text": bool((parsed.get("ideal_precis") or {}).get("text")),
+                    "reasons_for_low_score_count": len(parsed.get("reasons_for_low_score") or []),
+                }, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
     print(f"  Warning: grading JSON remained incomplete after retries ({last_err}); using fallback normalization.")
     fallback_student_title = str(answer_title_hint or "").strip() or "Precis"
     fallback_student_text = str(answer_block_text or "").strip()
@@ -2507,6 +2621,7 @@ def run_precis_grading(
         temperature=grading_temperature,
         repair_model=repair_model,
         repair_temperature=repair_temperature,
+        debug_llm_dir=debug_llm_dir,
     )
     timings["LLM grading"] = time.perf_counter() - t0
     print(f"LLM grading done in {_format_duration(timings['LLM grading'])}")
@@ -2625,9 +2740,31 @@ def run_precis_grading(
     if annotate_pdf_essay_pages is None:
         raise RuntimeError("annotate_pdf_with_precis.py is required for annotation rendering.")
 
+    # Essay-style: add spelling to source PDF before annotation so it appears on pages
+    pdf_for_annotation = pdf_path
+    temp_spelling_pdf: Optional[str] = None
+    source_spelling_placement: Optional[List[Dict[str, Any]]] = None
+    if (
+        normalized_spelling_errors
+        and enable_spelling_annotations
+        and add_spelling_annotations_to_source_pdf is not None
+    ):
+        try:
+            temp_spelling_pdf = os.path.join(
+                os.path.dirname(output_pdf_path) or ".",
+                "_precis_source_with_spelling_tmp.pdf",
+            )
+            source_spelling_placement = add_spelling_annotations_to_source_pdf(
+                pdf_path, temp_spelling_pdf, ocr_data, normalized_spelling_errors
+            )
+            if os.path.exists(temp_spelling_pdf):
+                pdf_for_annotation = temp_spelling_pdf
+        except Exception as e:
+            print(f"Warning: source-level spelling annotation failed: {e}")
+
     annotation_debug_path = os.path.join(debug_llm_dir, "annotations_debug.json")
     annotated_pages = annotate_pdf_essay_pages(
-        pdf_path=pdf_path,
+        pdf_path=pdf_for_annotation,
         ocr_data=ocr_data,
         structure={"outline": {"present": False}, "paragraph_map": []},
         grading=grading,
@@ -2668,9 +2805,11 @@ def run_precis_grading(
         _rdoc.close()
     first_answer_page_1based = 2 if has_question_page else 1
     merge_report_and_annotated_answer(report_tmp, annotated_pages, output_pdf_path)
-    placement_results: Optional[List[Dict[str, Any]]] = None
+    # Prefer source-level placement when spelling was baked into the PDF before annotation
+    placement_results: Optional[List[Dict[str, Any]]] = source_spelling_placement
     placement_error: Optional[str] = None
-    if normalized_spelling_errors and enable_spelling_annotations and add_spelling_annotations_to_merged_pdf is not None and page_transforms:
+    used_source_spelling = pdf_for_annotation != pdf_path
+    if not used_source_spelling and normalized_spelling_errors and enable_spelling_annotations and add_spelling_annotations_to_merged_pdf is not None and page_transforms:
         try:
             placement_results = add_spelling_annotations_to_merged_pdf(
                 output_pdf_path,
@@ -2683,25 +2822,31 @@ def run_precis_grading(
         except Exception as e:
             placement_error = str(e)
             placement_results = None
-        spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
-        if os.path.exists(spelling_debug_path):
-            try:
-                with open(spelling_debug_path, "r", encoding="utf-8") as f:
-                    debug_data = json.load(f)
-                if placement_results is not None:
-                    debug_data["placement"] = placement_results
-                    placement_failed_count = sum(1 for p in placement_results if p.get("status") == "not_found")
-                    debug_data["placement_failed_count"] = placement_failed_count
-                    debug_data["inline_rendered_count"] = len(placement_results) - placement_failed_count
-                if placement_error is not None:
-                    debug_data["placement_error"] = placement_error
-                with open(spelling_debug_path, "w", encoding="utf-8") as f:
-                    json.dump(debug_data, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
+    spelling_debug_path = os.path.join(debug_llm_dir, "spelling_errors_debug.json")
+    if normalized_spelling_errors and os.path.exists(spelling_debug_path):
+        try:
+            with open(spelling_debug_path, "r", encoding="utf-8") as f:
+                debug_data = json.load(f)
+            if placement_results is not None:
+                debug_data["placement"] = placement_results
+                placement_failed_count = sum(1 for p in placement_results if p.get("status") == "not_found")
+                debug_data["placement_failed_count"] = placement_failed_count
+                debug_data["inline_rendered_count"] = len(placement_results) - placement_failed_count
+                debug_data["placement_method"] = "source_pdf" if used_source_spelling else "merged_pdf"
+            if placement_error is not None:
+                debug_data["placement_error"] = placement_error
+            with open(spelling_debug_path, "w", encoding="utf-8") as f:
+                json.dump(debug_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
     if report_only_pdf_path is None:
         try:
             os.unlink(report_tmp)
+        except Exception:
+            pass
+    if temp_spelling_pdf and os.path.exists(temp_spelling_pdf):
+        try:
+            os.unlink(temp_spelling_pdf)
         except Exception:
             pass
     timings["Merge output PDF"] = time.perf_counter() - t0

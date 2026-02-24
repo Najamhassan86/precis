@@ -9,6 +9,14 @@ venv/
 # Environment/config secrets
 .env
 
+debug/
+debug_llm/
+debug_llm/precis_*.txt
+debug_llm/precis_*.json
+
+precis_result.json
+
+Reference/
 # Generated artifacts
 *.pdf
 *.json
